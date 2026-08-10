@@ -1,16 +1,24 @@
 # cathedral-voice
 
-Decentralized **ASR + TTS** scoring for [PHOSAI Avoices](https://voices.phosaico.com) on Bittensor **SN39**, with optional Cathedral thin weight relay.
+**cathedral-voice** is the speech lane for Cathedral on Bittensor **SN39**: miners serve real-time **ASR** and **TTS**, and validators measure that work so it can enter Cathedral’s SN39 weight vector.
 
-Formerly *violet-subnet*. Repo: [bateesatobi/cathedral-voice](https://github.com/bateesatobi/cathedral-voice).
+### What it does
 
-| Role | Job |
-|------|-----|
-| **Miner** | GPU sidecar serving Avoices-compatible ASR/TTS APIs |
-| **Validator** | Probe miners, score C/W/Q, post `violet_audio` scores, optionally thin-relay SN39 weights |
-| **Router** | Inside PHOSAI ASRAPI — picks miners, failover, work receipts |
+1. **Miners** expose a public HTTP sidecar (`/health`, `/transcribe`, streaming ASR/TTS, …) backed by GPU inference.
+2. **Validators** discover miners, probe health/quality, score **Capacity / Work / Quality** over a rolling window, and publish `violet_audio` score reports to the Cathedral publisher.
+3. **Optionally**, the same validator process runs the **Cathedral thin relay**: fetch the signed SN39 weight feed, verify it, and `set_weights` on netuid **39** — so voice scores and Cathedral’s other lanes share one on-chain vector without a second conflicting writer.
 
-Miners speak the **same endpoints** Avoices already uses (`/transcribe`, `/realtime/transcribe`, `/v1/audio/speech/stream`, …).
+```text
+Miners (ASR/TTS) ──► cathedral-voice validator ──► publisher (violet_audio)
+                                              └──► thin relay ──► SN39 set_weights
+```
+
+| Component | Responsibility |
+|-----------|----------------|
+| **Miner** | Serve ASR/TTS APIs; announce a public endpoint; report GPUs |
+| **Validator** | Probe, score, post `violet_audio`; optional SN39 thin `set_weights` |
+| **Publisher** (Cathedral) | Blend voice scores into the signed SN39 feed |
+| **Router** (optional) | Product backends can load-balance traffic across voice miners |
 
 ---
 
@@ -31,7 +39,7 @@ Miners speak the **same endpoints** Avoices already uses (`/transcribe`, `/realt
 ## Miner — quick start
 
 ```bash
-cd cathedral-voice   # or violet-subnet checkout
+cd cathedral-voice
 cp .env.example .env
 
 ./violet/miner/start.sh test                 # local samples, no chain
@@ -159,10 +167,10 @@ Full trust model: [UNIFIED_SN39_VALIDATOR.md](docs/UNIFIED_SN39_VALIDATOR.md).
 ## Rewards (voice scoring)
 
 ```text
-Score = Capacity (online GPUs) + Work (PHOSAI traffic) + Quality (probes)
+Score = Capacity (online GPUs) + Work (organic traffic) + Quality (probes)
 ```
 
-7-day rolling window. Details: [INCENTIVE.md](docs/INCENTIVE.md).
+7-day rolling window. Those scores feed Cathedral as `violet_audio`. Details: [INCENTIVE.md](docs/INCENTIVE.md).
 
 ```bash
 python scripts/simulate_scoring.py --sybil
@@ -170,20 +178,13 @@ python scripts/simulate_scoring.py --sybil
 
 ---
 
-## Customer traffic (PHOSAI)
-
-Apps call **Avoices / ASRAPI**. With `VIOLET_ROUTER_ENABLED=true`, the smart router load-balances across miners.
-
----
-
 ## Layout
 
 ```
 violet/           miner, validator, router, chain, cathedral (scores + thin relay)
-docker/           compose + sample ASR/TTS
+docker/           compose + sample ASR/TTS images
 scripts/          qualify, announce, cathedral score poster
 docs/             guides
-integration/      ASRAPI drop-in
 ```
 
-Python 3.10+. Optional extras: `pip install -e ".[chain,cathedral]"`.
+Python 3.10+. Install with `pip install -e ".[chain,cathedral]"`.
