@@ -29,28 +29,30 @@ Miners speak the **same endpoints** Avoices already uses (`/transcribe`, `/realt
 
 ```bash
 cd violet-subnet
-pip install -e ".[dev]"
 cp .env.example .env
 
-# Mock ASR/TTS (laptop OK)
-python -m uvicorn --app-dir docker/mock-asr app:app --port 9000 &
-python -m uvicorn --app-dir docker/mock-tts app:app --port 8080 &
+# Local (sample ASR/TTS images, no chain): builds, starts, waits healthy, qualifies
+./violet/miner/start.sh test
 
-MINER_PUBLIC_ENDPOINT=http://localhost:8091 \
-MINER_ASR_UPSTREAM=http://localhost:9000 \
-MINER_TTS_UPSTREAM=http://localhost:8080 \
-python -m violet.miner.run --no-chain &
+# Production (wallet in .env; add --gpu on NVIDIA hosts)
+./violet/miner/start.sh prod
+./violet/miner/start.sh prod --gpu
 
-python scripts/run_qualification.py http://localhost:8091
+./violet/miner/start.sh status
+./violet/miner/start.sh logs
+./violet/miner/start.sh stop
 ```
 
-**GPU production**
+**GPU production (manual)**
 
 ```bash
-# Edit .env: VIOLET_NETUID, wallet, MINER_PUBLIC_ENDPOINT, upstreams
-docker compose -f docker/docker-compose.miner.yml up -d
+# Edit .env: wallet, MINER_PUBLIC_ENDPOINT, upstreams
+# Netuids: mainnet 39 (BT_NETWORK=finney), testnet 292 (BT_NETWORK=test)
+docker compose -f docker/docker-compose.miner.yml \
+  -f docker/docker-compose.miner.prod.yml \
+  -f docker/docker-compose.miner.gpu.yml up -d
 
-btcli subnet register --netuid <netuid> \
+btcli subnet register --netuid 39 \
   --wallet.name <coldkey> --wallet.hotkey <miner>
 
 python scripts/announce_endpoint.py
@@ -63,15 +65,20 @@ Allowed GPUs only: A100 40/80, H100 80, H100 NVL, H200. Details: [MINER_GUIDE.md
 ## Validator — get started fast
 
 ```bash
-pip install -e ".[chain,dev]"
 cp .env.example .env
-# Set wallet, VALIDATOR_EVALSET_PATH (private real audio), VALIDATOR_DRY_RUN=true
 
-python -m violet.validator.run
-# Dashboard: http://localhost:8092
+# Offline local validator (points at a miner on the host by default)
+./violet/validator/start.sh test
+./violet/validator/start.sh test --miner http://host.docker.internal:8091
+
+# On-chain validator (wallet + evalset in .env; start dry-run)
+./violet/validator/start.sh prod
+
+./violet/validator/start.sh status
+./violet/validator/start.sh stop
 ```
 
-Or: `docker compose -f docker/docker-compose.validator.yml up -d`  
+Dashboard: `http://localhost:8092`  
 Guide: [VALIDATOR_GUIDE.md](docs/VALIDATOR_GUIDE.md).
 
 ---

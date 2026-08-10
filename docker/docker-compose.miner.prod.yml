@@ -1,0 +1,8 @@
+# Production miner extras: wallet mount for chain announce / signing.
+#
+# Used by: violet/miner/start.sh prod
+
+services:
+  violet-miner:
+    volumes:
+      - ${BT_WALLET_DIR:-${HOME}/.bittensor}:/home/violet/.bittensor:ro

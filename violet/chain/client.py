@@ -13,11 +13,8 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
-
-import bittensor as bt
-from bittensor._generated.calls import Commitments
 
 from ..config import ChainConfig
 from ..constants import SPEC_VERSION
@@ -35,19 +32,38 @@ class ChainError(RuntimeError):
     """Raised when a chain operation fails in a way the caller must handle."""
 
 
+def _require_bittensor():
+    """Import the SDK only when chain access is actually needed.
+
+    Lets miners and local validators run ``--no-chain`` / static endpoints
+    without installing ``bittensor``.
+    """
+    try:
+        import bittensor as bt
+        from bittensor._generated.calls import Commitments
+    except ImportError as exc:  # pragma: no cover - optional extra
+        raise ChainError(
+            "bittensor is required for chain operations. "
+            "Install with: pip install 'violet-subnet[chain]' "
+            "or run with --no-chain / VIOLET_STATIC_MINERS for local demos."
+        ) from exc
+    return bt, Commitments
+
+
 class ChainClient:
     """Async access to the Violet subnet's chain state and extrinsics."""
 
     def __init__(self, config: ChainConfig):
         self.config = config
-        self._client: Optional[bt.Client] = None
-        self._wallet: Optional[bt.Wallet] = None
+        self._client: Optional[Any] = None
+        self._wallet: Optional[Any] = None
         self._lock = asyncio.Lock()
 
     # -- lifecycle ---------------------------------------------------------
 
     async def connect(self) -> "ChainClient":
         if self._client is None:
+            bt, _Commitments = _require_bittensor()
             # ``allow_raw_calls`` is needed for ``Commitments.set_commitment``,
             # which the lean SDK does not expose as a first-class intent.
             policy = bt.Policy(
@@ -73,13 +89,13 @@ class ChainClient:
         await self.close()
 
     @property
-    def client(self) -> bt.Client:
+    def client(self) -> Any:
         if self._client is None:
             raise ChainError("ChainClient.connect() has not been awaited")
         return self._client
 
     @property
-    def wallet(self) -> bt.Wallet:
+    def wallet(self) -> Any:
         """The signing wallet, loaded lazily.
 
         Read-only deployments set ``BT_SIGNING_ENABLED=false`` and never reach
@@ -91,6 +107,7 @@ class ChainClient:
                 "signing is disabled on this component (BT_SIGNING_ENABLED=false)"
             )
         if self._wallet is None:
+            bt, _Commitments = _require_bittensor()
             kwargs = {
                 "name": self.config.wallet_name,
                 "hotkey": self.config.wallet_hotkey,
@@ -109,12 +126,13 @@ class ChainClient:
     async def block(self) -> int:
         return await self.client.block()
 
-    async def metagraph(self, *, commitments: bool = True) -> bt.Metagraph:
+    async def metagraph(self, *, commitments: bool = True) -> Any:
         """Fetch the full subnet state.
 
         Raises rather than returning ``None`` so callers do not silently score
         an empty network and submit uniform weights.
         """
+        bt, _Commitments = _require_bittensor()
         graph = await bt.metagraph.fetch(
             self.client, self.config.netuid, commitments=commitments
         )
@@ -125,7 +143,7 @@ class ChainClient:
         return graph
 
     async def announcements(
-        self, graph: Optional[bt.Metagraph] = None
+        self, graph: Optional[Any] = None
     ) -> Dict[str, MinerAnnouncement]:
         """Decode every valid Violet announcement on the subnet, keyed by hotkey.
 
@@ -171,6 +189,7 @@ class ChainClient:
 
     async def publish_announcement(self, announcement: MinerAnnouncement) -> bool:
         """Publish the miner's endpoint payload as an on-chain commitment."""
+        _bt, Commitments = _require_bittensor()
         encoded = encode_announcement(announcement).encode("utf-8")
         info = {"fields": [{f"Raw{len(encoded)}": encoded}]}
         call = Commitments.set_commitment(netuid=self.config.netuid, info=info)
@@ -207,6 +226,7 @@ class ChainClient:
             )
             return False
 
+        bt, _Commitments = _require_bittensor()
         async with self._lock:
             result = await self.client.execute(
                 bt.ServeAxon(
@@ -247,6 +267,7 @@ class ChainClient:
             )
             return False
 
+        bt, _Commitments = _require_bittensor()
         async with self._lock:
             result = await self.client.execute(
                 bt.SetWeights(

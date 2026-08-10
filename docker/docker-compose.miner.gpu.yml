@@ -1,0 +1,30 @@
+# GPU host extras for the miner stack.
+#
+# Used by: violet/miner/start.sh prod
+#
+#   docker compose -f docker/docker-compose.miner.yml \
+#                  -f docker/docker-compose.miner.gpu.yml up -d
+
+services:
+  violet-asr:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  violet-tts:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  violet-miner:
+    volumes:
+      - ${BT_WALLET_DIR:-${HOME}/.bittensor}:/home/violet/.bittensor:ro
+      - /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro

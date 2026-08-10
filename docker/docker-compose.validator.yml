@@ -15,19 +15,26 @@ services:
     image: violet/validator:1.4.0
     ports:
       # Public scoring dashboard (TDD 9.3).
-      - "8092:8092"
+      - "${VALIDATOR_DASHBOARD_PORT:-8092}:8092"
     env_file:
-      - ../.env
+      - path: ../.env
+        required: false
     environment:
       VALIDATOR_DB_PATH: /data/validator.sqlite3
       VALIDATOR_DASHBOARD_HOST: 0.0.0.0
       VALIDATOR_DASHBOARD_PORT: "8092"
     volumes:
       - validator-data:/data
-      - ${BT_WALLET_DIR:-~/.bittensor}:/home/violet/.bittensor:ro
+      - ${BT_WALLET_DIR:-${HOME}/.bittensor}:/home/violet/.bittensor:ro
       # A private evaluation corpus with real audio. Without it, word error rate
       # is not measurable - see docs/VALIDATOR_GUIDE.md.
       - ${VIOLET_EVALSET_DIR:-./evalset}:/evalset:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8092/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
     restart: unless-stopped
 
 volumes:

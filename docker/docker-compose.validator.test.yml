@@ -1,0 +1,50 @@
+# Offline / local validator (no Bittensor chain).
+#
+# Used by: violet/validator/start.sh test
+#
+# Points at a miner HTTP endpoint (default: host machine :8091).
+
+name: violet-validator
+
+services:
+  validator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.validator
+    image: violet/validator:1.4.0
+    ports:
+      - "${VALIDATOR_DASHBOARD_PORT:-8092}:8092"
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      VALIDATOR_DB_PATH: /data/local_validator.sqlite3
+      VALIDATOR_DASHBOARD_HOST: 0.0.0.0
+      VALIDATOR_DASHBOARD_PORT: "8092"
+      VALIDATOR_DRY_RUN: "true"
+      VIOLET_STATIC_MINERS: ${VIOLET_STATIC_MINERS:-http://host.docker.internal:8091}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - validator-data:/data
+      - ../scripts:/app/scripts:ro
+    entrypoint: ["python", "/app/scripts/run_local_validator.py"]
+    command:
+      [
+        "--endpoint",
+        "${VIOLET_STATIC_MINERS:-http://host.docker.internal:8091}",
+        "--port",
+        "8092",
+        "--interval",
+        "${VALIDATOR_LOCAL_INTERVAL:-45}",
+      ]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8092/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  validator-data:

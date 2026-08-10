@@ -131,13 +131,18 @@ class MinerRegistry:
     # -- discovery ---------------------------------------------------------
 
     async def discover(self) -> int:
-        """Refresh the miner set from the chain.
+        """Refresh the miner set from the chain (and keep any static seeds).
 
         Existing live state is carried over: rediscovery must not reset a
         miner's latency history or mark a healthy miner unknown, or the router
         would briefly lose its ranking every discovery interval.
         """
+        static = self._static_miners()
         if self.chain is None:
+            if static and not self._miners:
+                async with self._lock:
+                    self._miners = dict(static)
+                logger.info("router seeded %d static miner(s) (no chain)", len(static))
             return len(self._miners)
 
         try:
@@ -149,7 +154,7 @@ class MinerRegistry:
             return len(self._miners)
 
         neurons = {str(neuron.hotkey): neuron for neuron in graph.neurons}
-        discovered: Dict[str, MinerEndpoint] = {}
+        discovered: Dict[str, MinerEndpoint] = dict(static)
 
         for hotkey, announcement in announcements.items():
             neuron = neurons.get(hotkey)
@@ -158,7 +163,7 @@ class MinerRegistry:
             if getattr(neuron, "validator_permit", False):
                 continue
 
-            existing = self._miners.get(hotkey)
+            existing = self._miners.get(hotkey) or discovered.get(hotkey)
             miner = existing or MinerEndpoint(
                 hotkey=hotkey,
                 uid=int(neuron.uid),
@@ -182,6 +187,29 @@ class MinerRegistry:
         self._last_discovery_error = ""
         logger.info("router discovered %d miners", len(discovered))
         return len(discovered)
+
+    def _static_miners(self) -> Dict[str, MinerEndpoint]:
+        """Local/offline miner seeds from ``VIOLET_STATIC_MINERS``."""
+        raw = (self.config.static_miners or "").strip()
+        if not raw:
+            return {}
+        out: Dict[str, MinerEndpoint] = {}
+        for index, piece in enumerate(raw.split(",")):
+            endpoint = piece.strip().rstrip("/")
+            if not endpoint:
+                continue
+            hotkey = f"static-local-{index}"
+            out[hotkey] = MinerEndpoint(
+                hotkey=hotkey,
+                uid=9000 + index,
+                endpoint=endpoint,
+                services=list(SERVICES),
+                incentive=1.0,
+                healthy=False,  # health sweep marks them live
+                max_concurrent_asr=8,
+                max_concurrent_tts=10,
+            )
+        return out
 
     # -- health ------------------------------------------------------------
 

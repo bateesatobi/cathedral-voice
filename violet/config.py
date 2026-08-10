@@ -13,6 +13,8 @@ from typing import List, Optional
 
 from .constants import (
     DEFAULT_PHASE,
+    NETUID_MAINNET,
+    NETUID_TESTNET,
     PHASES,
     SCORE_WINDOW_DAYS,
     SERVICES,
@@ -54,11 +56,33 @@ def _env_list(name: str, default: List[str]) -> List[str]:
 # --------------------------------------------------------------------------
 
 
+def _default_netuid_for_network(network: str) -> int:
+    """Resolve Violet's registered netuid from ``BT_NETWORK``."""
+    name = (network or "").strip().lower()
+    if name in {"test", "testnet"}:
+        return NETUID_TESTNET
+    # finney / main / mainnet / empty → mainnet SN39
+    return NETUID_MAINNET
+
+
+def _resolve_netuid() -> int:
+    """``VIOLET_NETUID`` wins when set; otherwise mainnet 39 / testnet 292."""
+    explicit = _env("VIOLET_NETUID")
+    if explicit:
+        return int(explicit)
+    return _default_netuid_for_network(_env("BT_NETWORK", "finney"))
+
+
 @dataclass
 class ChainConfig:
-    """Connection details for the Bittensor network."""
+    """Connection details for the Bittensor network.
 
-    netuid: int = field(default_factory=lambda: _env_int("VIOLET_NETUID", 0))
+    Violet is registered as **netuid 39** on mainnet (``finney``) and
+    **netuid 292** on testnet. Set ``BT_NETWORK`` accordingly; override with
+    ``VIOLET_NETUID`` only if you intentionally need a different subnet.
+    """
+
+    netuid: int = field(default_factory=_resolve_netuid)
     network: str = field(default_factory=lambda: _env("BT_NETWORK", "finney"))
     wallet_name: str = field(default_factory=lambda: _env("BT_WALLET_NAME", "default"))
     wallet_hotkey: str = field(default_factory=lambda: _env("BT_WALLET_HOTKEY", "default"))
@@ -69,7 +93,19 @@ class ChainConfig:
     def validate(self) -> None:
         if self.netuid <= 0:
             raise ValueError(
-                "VIOLET_NETUID must be set to the registered Violet subnet netuid"
+                "VIOLET_NETUID must be set to the registered Violet subnet netuid "
+                f"(mainnet={NETUID_MAINNET}, testnet={NETUID_TESTNET})"
+            )
+        name = (self.network or "").strip().lower()
+        if name in {"finney", "main", "mainnet"} and self.netuid != NETUID_MAINNET:
+            raise ValueError(
+                f"BT_NETWORK={self.network!r} requires VIOLET_NETUID={NETUID_MAINNET} "
+                f"(got {self.netuid})"
+            )
+        if name in {"test", "testnet"} and self.netuid != NETUID_TESTNET:
+            raise ValueError(
+                f"BT_NETWORK={self.network!r} requires VIOLET_NETUID={NETUID_TESTNET} "
+                f"(got {self.netuid})"
             )
 
 
@@ -287,9 +323,13 @@ class RouterConfig:
         default_factory=lambda: _env_int("VIOLET_ROUTER_UNHEALTHY_THRESHOLD", 3)
     )
     #: Attempts across distinct miners before giving up (or using legacy fallback
-#: if ``VIOLET_FALLBACK_*`` is set). Prefer trying every healthy miner rather
-#: than a hardcoded host when product traffic must stay on the subnet.
-max_attempts: int = field(default_factory=lambda: _env_int("VIOLET_ROUTER_MAX_ATTEMPTS", 10))
+    #: if ``VIOLET_FALLBACK_*`` is set). Prefer trying every healthy miner rather
+    #: than a hardcoded host when product traffic must stay on the subnet.
+    max_attempts: int = field(default_factory=lambda: _env_int("VIOLET_ROUTER_MAX_ATTEMPTS", 10))
+
+    #: Comma-separated miner base URLs for local / offline testing without a
+    #: chain (e.g. ``http://127.0.0.1:8091``). Seeded into the registry on start.
+    static_miners: str = field(default_factory=lambda: _env("VIOLET_STATIC_MINERS"))
 
     #: Weighting of the selector's scoring terms.
     weight_latency: float = field(default_factory=lambda: _env_float("VIOLET_SELECT_W_LATENCY", 0.4))

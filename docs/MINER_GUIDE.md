@@ -32,22 +32,12 @@ Anything else (RTX, L40S, …) → listed under `rejected_gpus`, earns **0**.
 
 ```bash
 cd violet-subnet
-pip install -e ".[dev]"
 cp .env.example .env
-
-# Sample ASR + TTS (same API as production)
-python -m uvicorn --app-dir docker/mock-asr app:app --port 9000 &
-python -m uvicorn --app-dir docker/mock-tts app:app --port 8080 &
-
-# Miner sidecar
-MINER_PUBLIC_ENDPOINT=http://localhost:8091 \
-MINER_ASR_UPSTREAM=http://localhost:9000 \
-MINER_TTS_UPSTREAM=http://localhost:8080 \
-python -m violet.miner.run --no-chain &
-
-# Self-check (what validators run)
-python scripts/run_qualification.py http://localhost:8091
+./violet/miner/start.sh test
 ```
+
+This builds the sample ASR/TTS + miner images, streams logs until healthy, and
+runs a qualification smoke test. Use `./violet/miner/start.sh stop` to tear down.
 
 ---
 
@@ -63,8 +53,8 @@ cp .env.example .env
 Set at minimum:
 
 ```bash
-VIOLET_NETUID=<netuid>
-BT_NETWORK=finney          # or your network
+VIOLET_NETUID=39           # mainnet; use 292 on testnet (or leave blank)
+BT_NETWORK=finney          # or test → auto-selects netuid 292
 BT_WALLET_NAME=my-coldkey
 BT_WALLET_HOTKEY=my-miner
 
@@ -106,9 +96,10 @@ Confirm `capacity_units > 0` and no unexpected `rejected_gpus`.
 
 ```bash
 btcli subnet register \
-  --netuid <netuid> \
+  --netuid 39 \
   --wallet.name my-coldkey \
   --wallet.hotkey my-miner
+# testnet: --netuid 292 and BT_NETWORK=test
 ```
 
 ### 5. Announce endpoint

@@ -34,6 +34,18 @@ No GPU required. You need a private eval corpus with real audio for meaningful W
 
 ```bash
 cd violet-subnet
+cp .env.example .env
+
+# Offline (no chain) — after a miner is up on :8091
+./violet/validator/start.sh test
+
+# On-chain
+./violet/validator/start.sh prod
+```
+
+Or manually:
+
+```bash
 pip install -e ".[chain,dev]"
 cp .env.example .env
 ```
@@ -41,7 +53,7 @@ cp .env.example .env
 Minimum `.env`:
 
 ```bash
-VIOLET_NETUID=<netuid>
+VIOLET_NETUID=39           # mainnet; use 292 on testnet (or leave blank)
 BT_NETWORK=finney
 BT_WALLET_NAME=my-coldkey
 BT_WALLET_HOTKEY=my-validator

@@ -4,6 +4,10 @@ ASR/TTS for the PHOSAI Avoices product; Polaris/Violet miners and validators
 supply the inference layer. Product billing and public APIs stay on Avoices —
 Violet only replaces the inference hop.
 
+**Subnet IDs:** mainnet (``finney``) **netuid 39**, testnet **netuid 292**.
+Miners and validators pick these from ``BT_NETWORK`` unless ``VIOLET_NETUID``
+is set explicitly.
+
 ## Layers
 
 ```

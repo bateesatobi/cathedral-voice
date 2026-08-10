@@ -24,6 +24,10 @@ SPEC_VERSION = 1
 #: the same netuid are ignored cheaply.
 COMMITMENT_MAGIC = "violet1"
 
+#: Registered Violet subnet IDs on Bittensor.
+NETUID_MAINNET = 39
+NETUID_TESTNET = 292
+
 # --------------------------------------------------------------------------
 # Hardware (TDD 4.1)
 # --------------------------------------------------------------------------

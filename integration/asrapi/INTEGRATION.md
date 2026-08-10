@@ -40,7 +40,7 @@ violet-subnet>=1.4.0
 # Off until you flip this.
 VIOLET_ROUTER_ENABLED=false
 
-VIOLET_NETUID=<your netuid>
+VIOLET_NETUID=39           # mainnet; use 292 with BT_NETWORK=test
 BT_NETWORK=finney
 
 # Fallbacks: the servers Avoices uses today.
