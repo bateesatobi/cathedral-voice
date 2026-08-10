@@ -19,14 +19,75 @@ import aiohttp
 
 from ..chain import ChainClient
 from ..config import RouterConfig
-from ..constants import SERVICE_ASR, SERVICE_TTS, SERVICES
-from ..protocol import PATH_HEALTH, HealthReport
+from ..constants import GPU_TIERS_BY_KEY, SERVICE_ASR, SERVICE_TTS, SERVICES
+from ..protocol import PATH_HEALTH, GpuInfo, HealthReport
 
 logger = logging.getLogger("violet.router.registry")
 
 #: Weight of a new latency sample in the exponential moving average. Low so a
 #: single slow request does not evict an otherwise fast miner from rotation.
 LATENCY_EMA_ALPHA = 0.2
+
+
+def _short_gpu_name(product_name: str, tier_key: str = "") -> str:
+    """Human label for leaderboards — prefer H200 over full NVIDIA strings."""
+    if tier_key and tier_key in GPU_TIERS_BY_KEY:
+        return GPU_TIERS_BY_KEY[tier_key].display_name
+    name = (product_name or "").strip()
+    if not name and tier_key:
+        return tier_key.upper().replace("_", " ")
+    # Strip common vendor prefixes for a tighter table cell.
+    for prefix in ("NVIDIA ", "nvidia ", "Tesla ", "GeForce "):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+    return name or "GPU"
+
+
+def summarize_gpus(gpus: List[GpuInfo]) -> tuple[str, int, str, float, str]:
+    """Return ``(model, count, tier_key, vram_gb, summary)`` from a capacity inventory."""
+    if not gpus:
+        return "", 0, "", 0.0, ""
+
+    counts: Dict[str, int] = {}
+    labels: Dict[str, str] = {}
+    for gpu in gpus:
+        key = gpu.tier_key or gpu.product_name or "unknown"
+        counts[key] = counts.get(key, 0) + 1
+        labels[key] = _short_gpu_name(gpu.product_name, gpu.tier_key)
+
+    primary = max(gpus, key=lambda g: (g.multiplier, g.vram_gb))
+    model = _short_gpu_name(primary.product_name, primary.tier_key)
+    summary = " + ".join(
+        f"{count}×{labels[key]}" for key, count in sorted(counts.items(), key=lambda kv: -kv[1])
+    )
+    return model, len(gpus), primary.tier_key or "", float(primary.vram_gb or 0.0), summary
+
+
+def summarize_announced_gpus(gpus: Dict[str, int]) -> tuple[str, int, str, float, str]:
+    """Same shape as :func:`summarize_gpus` for on-chain ``{tier_key: count}``."""
+    if not gpus:
+        return "", 0, "", 0.0, ""
+    parts = []
+    total = 0
+    best_key = ""
+    best_mult = -1.0
+    for key, count in gpus.items():
+        n = int(count or 0)
+        if n <= 0:
+            continue
+        total += n
+        tier = GPU_TIERS_BY_KEY.get(key)
+        label = tier.display_name if tier else key.upper().replace("_", " ")
+        parts.append((n, label, key, tier.multiplier if tier else 0.0, tier.vram_gb if tier else 0.0))
+        if (tier.multiplier if tier else 0.0) > best_mult:
+            best_mult = tier.multiplier if tier else 0.0
+            best_key = key
+    if not parts:
+        return "", 0, "", 0.0, ""
+    parts.sort(key=lambda p: (-p[3], -p[0]))
+    primary = next(p for p in parts if p[2] == best_key) if best_key else parts[0]
+    summary = " + ".join(f"{n}×{label}" for n, label, *_ in parts)
+    return primary[1], total, primary[2], float(primary[4] or 0.0), summary
 
 
 @dataclass
@@ -47,6 +108,14 @@ class MinerEndpoint:
     load_factor: float = 0.0
     max_concurrent_asr: int = 0
     max_concurrent_tts: int = 0
+
+    #: Hardware claimed on ``/health`` (and/or the on-chain announcement).
+    gpu_model: str = ""
+    gpu_count: int = 0
+    gpu_tier: str = ""
+    vram_gb: float = 0.0
+    #: Compact inventory string, e.g. ``"2×H200 + 1×H100"``.
+    gpu_summary: str = ""
 
     #: Requests this router currently has in flight against the miner. Tracked
     #: locally because the miner's own /capacity is only as fresh as the last
@@ -175,6 +244,16 @@ class MinerRegistry:
             miner.services = announcement.services or miner.services or list(SERVICES)
             miner.incentive = float(getattr(neuron, "incentive", 0.0) or 0.0)
             miner.capacity_units = announcement.capacity_units
+            # Seed hardware from the commitment until /health fills live inventory.
+            model, count, tier, vram, summary = summarize_announced_gpus(
+                announcement.gpus or {}
+            )
+            if count and not miner.gpu_count:
+                miner.gpu_model = model
+                miner.gpu_count = count
+                miner.gpu_tier = tier
+                miner.vram_gb = vram
+                miner.gpu_summary = summary
             discovered[hotkey] = miner
 
         async with self._lock:
@@ -262,6 +341,15 @@ class MinerRegistry:
                     miner.max_concurrent_asr = report.capacity.max_concurrent_asr
                     miner.max_concurrent_tts = report.capacity.max_concurrent_tts
                     miner.capacity_units = report.capacity.capacity_units
+                    model, count, tier, vram, summary = summarize_gpus(
+                        report.capacity.gpus or []
+                    )
+                    if count:
+                        miner.gpu_model = model
+                        miner.gpu_count = count
+                        miner.gpu_tier = tier
+                        miner.vram_gb = vram
+                        miner.gpu_summary = summary
         else:
             miner.consecutive_failures += 1
             if (
@@ -370,6 +458,11 @@ class MinerRegistry:
                     "success_rate": round(miner.success_ema, 3),
                     "capacity_units": miner.capacity_units,
                     "incentive": round(miner.incentive, 6),
+                    "gpu_model": miner.gpu_model,
+                    "gpu_count": miner.gpu_count,
+                    "gpu_tier": miner.gpu_tier,
+                    "vram_gb": miner.vram_gb,
+                    "gpu_summary": miner.gpu_summary,
                 }
                 for miner in sorted(miners, key=lambda m: m.hotkey)
             ],

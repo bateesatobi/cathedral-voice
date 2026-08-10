@@ -25,6 +25,18 @@ services:
               capabilities: [gpu]
 
   violet-miner:
+    # Same GPU visibility as ASR/TTS so nvidia-smi inventories every card.
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     volumes:
       - ${BT_WALLET_DIR:-${HOME}/.bittensor}:/home/violet/.bittensor:ro
+      # Toolkit usually injects nvidia-smi; keep host bind as a fallback.
       - /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro

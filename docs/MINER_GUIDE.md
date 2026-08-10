@@ -58,8 +58,13 @@ BT_NETWORK=finney          # or test → auto-selects netuid 292
 BT_WALLET_NAME=my-coldkey
 BT_WALLET_HOTKEY=my-miner
 
-MINER_PUBLIC_ENDPOINT=https://miner.yourdomain.com
+MINER_PUBLIC_ENDPOINT=http://YOUR_PUBLIC_IP:8091
+# or HTTPS DNS: https://miner.yourdomain.com
 MINER_SERVICES=asr,tts
+# Ports — leave blank for start.sh auto-detect, or set explicitly:
+# ASR_PORT=9000
+# TTS_PORT=8080
+# MINER_PORT=8091
 MINER_ASR_UPSTREAM=http://violet-asr:9000
 MINER_TTS_UPSTREAM=http://violet-tts:8080
 # Leave concurrency at 0 to auto-derive from GPUs
@@ -67,9 +72,17 @@ MINER_MAX_CONCURRENT_ASR=0
 MINER_MAX_CONCURRENT_TTS=0
 ```
 
+**Public IP vs chain axon:** set the public IP yourself; `start.sh` appends the auto-detected **miner** port. The on-chain axon is written *from* that URL — the chain does not invent your IP.
+
+**ASR / TTS ports:** they listen on different ports (defaults `9000` / `8080`). `start.sh` picks them automatically (already-healthy `/health`, else free port, else default) and wires `MINER_ASR_UPSTREAM` / `MINER_TTS_UPSTREAM`. Validators only dial the miner; the sidecar proxies to ASR/TTS.
+
+`./violet/miner/start.sh prod` prompts for public IP and prints the resolved ASR/TTS/miner ports.
+
 ### 2. Run with Docker
 
 ```bash
+./violet/miner/start.sh prod --gpu
+# or:
 docker compose -f docker/docker-compose.miner.yml up -d
 ```
 

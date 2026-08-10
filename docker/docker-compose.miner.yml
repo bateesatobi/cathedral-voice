@@ -7,6 +7,11 @@
 # replace the `image:` on violet-asr and violet-tts with the official published
 # images and drop the `build:` block. Nothing else changes - the sample and
 # official images speak the same wire contract.
+#
+# Ports (set by violet/miner/start.sh or .env):
+#   ASR_PORT   default 9000
+#   TTS_PORT   default 8080
+#   MINER_PORT default 8091
 
 name: violet-miner
 
@@ -20,11 +25,11 @@ services:
     image: violet/sample-asr:1.4.0
     environment:
       SERVICE: asr
-      PORT: "9000"
+      PORT: "${ASR_PORT:-9000}"
     expose:
-      - "9000"
+      - "${ASR_PORT:-9000}"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:9000/health"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:$${PORT}/health"]
       interval: 10s
       timeout: 4s
       retries: 12
@@ -40,11 +45,11 @@ services:
     image: violet/sample-tts:1.4.0
     environment:
       SERVICE: tts
-      PORT: "8080"
+      PORT: "${TTS_PORT:-8080}"
     expose:
-      - "8080"
+      - "${TTS_PORT:-8080}"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:$${PORT}/health"]
       interval: 10s
       timeout: 4s
       retries: 12
@@ -62,20 +67,22 @@ services:
       violet-tts:
         condition: service_healthy
     ports:
-      - "${MINER_PORT:-8091}:8091"
+      - "${MINER_PORT:-8091}:${MINER_PORT:-8091}"
     env_file:
       - path: ../.env
         required: false
     environment:
-      MINER_ASR_UPSTREAM: http://violet-asr:9000
-      MINER_TTS_UPSTREAM: http://violet-tts:8080
+      MINER_ASR_UPSTREAM: ${MINER_ASR_UPSTREAM:-http://violet-asr:${ASR_PORT:-9000}}
+      MINER_TTS_UPSTREAM: ${MINER_TTS_UPSTREAM:-http://violet-tts:${TTS_PORT:-8080}}
       MINER_HOST: 0.0.0.0
-      MINER_PORT: "8091"
-      MINER_PUBLIC_ENDPOINT: ${MINER_PUBLIC_ENDPOINT:-http://127.0.0.1:8091}
+      MINER_PORT: "${MINER_PORT:-8091}"
+      MINER_PUBLIC_ENDPOINT: ${MINER_PUBLIC_ENDPOINT:-http://127.0.0.1:${MINER_PORT:-8091}}
+      ASR_PORT: "${ASR_PORT:-9000}"
+      TTS_PORT: "${TTS_PORT:-8080}"
     # Wallet / nvidia mounts are added by docker-compose.miner.prod.yml
     # and docker-compose.miner.gpu.yml (see violet/miner/start.sh).
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8091/health"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:$${MINER_PORT}/health"]
       interval: 10s
       timeout: 5s
       retries: 18
