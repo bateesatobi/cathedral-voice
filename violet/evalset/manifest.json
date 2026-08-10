@@ -1,0 +1,97 @@
+{
+  "name": "violet-builtin-v1",
+  "notes": [
+    "Built-in bootstrap corpus. ASR items carry no audio file, so audio is synthesised deterministically and WER is NOT measurable against them.",
+    "Production validators must point VALIDATOR_EVALSET_PATH at a private corpus with real audio, rotated on a schedule (TDD 9.3).",
+    "Add an 'audio_path' to each ASR item, relative to this manifest, to enable real WER scoring.",
+    "TTS items are fully usable as shipped: content fidelity is measured from the returned audio against the prompt text."
+  ],
+  "asr": [
+    {
+      "id": "asr-eng-001",
+      "language": "eng",
+      "reference": "the quick brown fox jumps over the lazy dog",
+      "duration_s": 3.0
+    },
+    {
+      "id": "asr-eng-002",
+      "language": "eng",
+      "reference": "please transcribe this recording accurately and completely",
+      "duration_s": 4.0
+    },
+    {
+      "id": "asr-swa-001",
+      "language": "swa",
+      "reference": "habari ya asubuhi ndugu zangu karibuni sana",
+      "duration_s": 3.5
+    },
+    {
+      "id": "asr-lug-001",
+      "language": "lug",
+      "reference": "wasuze otya nno ssebo nsanyuse okukulaba",
+      "duration_s": 3.5
+    },
+    {
+      "id": "asr-nyn-001",
+      "language": "nyn",
+      "reference": "agandi nyowe ndi kurungi webale munonga",
+      "duration_s": 3.0
+    },
+    {
+      "id": "asr-ach-001",
+      "language": "ach",
+      "reference": "itye nining wan waco ni apwoyo matek",
+      "duration_s": 3.0
+    },
+    {
+      "id": "asr-teo-001",
+      "language": "teo",
+      "reference": "yoga noi eong ajokus akwap kere",
+      "duration_s": 3.0
+    },
+    {
+      "id": "asr-kin-001",
+      "language": "kin",
+      "reference": "mwaramutse murakoze cyane kubwacyubahiro",
+      "duration_s": 3.0
+    }
+  ],
+  "tts": [
+    {
+      "id": "tts-eng-001",
+      "language": "en",
+      "text": "Violet supplies decentralized speech inference for the Avoices platform.",
+      "speaker_id": "eng_female_1"
+    },
+    {
+      "id": "tts-eng-002",
+      "language": "en",
+      "text": "Please synthesize this sentence clearly and at a natural pace.",
+      "speaker_id": "eng_male_1"
+    },
+    {
+      "id": "tts-swa-001",
+      "language": "swa",
+      "text": "Karibu kwenye jukwaa la sauti la Avoices, tunafurahi kukuona.",
+      "speaker_id": "swa_male_3"
+    },
+    {
+      "id": "tts-lug-001",
+      "language": "lug",
+      "text": "Tukwaniriza ku mukutu gwa Avoices, tusanyuse nnyo okukulaba.",
+      "speaker_id": "lug_female_1"
+    },
+    {
+      "id": "tts-kin-001",
+      "language": "kin",
+      "text": "Murakaza neza kuri Avoices, turishimiye kubakira.",
+      "speaker_id": "kin_female_1"
+    },
+    {
+      "id": "tts-yor-001",
+      "language": "yor",
+      "text": "Kaabo si Avoices, inu wa dun lati ri yin.",
+      "speaker_id": "yor_female_1"
+    }
+  ]
+}

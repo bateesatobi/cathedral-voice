@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "violet-subnet"
+version = "1.4.0"
+description = "Decentralized ASR/TTS inference subnet for the Avoices platform"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Phosaico" }]
+keywords = ["bittensor", "subnet", "asr", "tts", "speech", "inference"]
+
+# Deliberately minimal. The miner sidecar and the validator must both be cheap
+# to run; anything needing a GPU or a model download lives in the official
+# inference images, not here.
+dependencies = [
+    "aiohttp>=3.9",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "websockets>=12.0",
+    "python-dotenv>=1.0",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+# The chain layer. Split out so the router can be embedded in the Avoices
+# backend, and the mock images can run, without pulling in the full SDK.
+chain = ["bittensor>=11.0,<12"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+violet-miner = "violet.miner.run:main"
+violet-validator = "violet.validator.run:main"
+
+[project.urls]
+Homepage = "https://voices.phosaico.com"
+
+[tool.setuptools.packages.find]
+include = ["violet*"]
+
+[tool.setuptools.package-data]
+"violet.evalset" = ["*.json", "audio/*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

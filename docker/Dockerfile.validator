@@ -1,0 +1,40 @@
+# Violet validator.
+#
+# CPU-only by design (see violet/validator/metrics.py): every quality metric is
+# an edit distance or a signal-level check, so a validator costs a small VM
+# rather than a GPU. That keeps the validator set open rather than restricted to
+# operators who can afford accelerators.
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml README.md ./
+COPY violet ./violet
+
+RUN pip install --no-cache-dir ".[chain]"
+
+RUN useradd --create-home --uid 10002 violet \
+    && mkdir -p /data /home/violet/.bittensor \
+    && chown -R violet:violet /app /data /home/violet
+USER violet
+
+# The rolling scoring window lives here. Mount it: losing it resets every
+# miner's seven-day history, which is both unfair and exploitable.
+VOLUME ["/data"]
+ENV VALIDATOR_DB_PATH=/data/validator.sqlite3
+
+EXPOSE 8092
+
+HEALTHCHECK --interval=60s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsS http://localhost:8092/health || exit 1
+
+ENTRYPOINT ["python", "-m", "violet.validator.run"]

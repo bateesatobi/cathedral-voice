@@ -1,0 +1,38 @@
+# Violet miner sidecar.
+#
+# Contains no models and needs no GPU: it fronts the official ASR/TTS
+# containers running alongside it. Kept slim so an operator's GPU host spends
+# its memory on inference, not on the control plane.
+
+FROM python:3.11-slim AS base
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# The sidecar reads nvidia-smi to inventory the host's GPUs. It is not installed
+# here: the host's driver binary is bind-mounted in by the compose file, so the
+# reported version always matches the driver actually running.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml README.md ./
+COPY violet ./violet
+
+RUN pip install --no-cache-dir ".[chain]"
+
+# Non-root: the sidecar holds a hotkey and is publicly reachable.
+RUN useradd --create-home --uid 10001 violet \
+    && mkdir -p /home/violet/.bittensor \
+    && chown -R violet:violet /app /home/violet
+USER violet
+
+EXPOSE 8091
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://localhost:8091/health || exit 1
+
+ENTRYPOINT ["python", "-m", "violet.miner.run"]

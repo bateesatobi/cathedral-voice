@@ -1,0 +1,37 @@
+# Sample ASR/TTS inference container.
+#
+# Stands in for the official Violet images so the whole subnet - miner sidecar,
+# validator qualification suite, smart router - can be exercised end to end on a
+# laptop with no GPU. Select which service to run with SERVICE=asr|tts.
+#
+# Replace with the official image by pointing MINER_ASR_UPSTREAM /
+# MINER_TTS_UPSTREAM at it. Nothing else changes: the wire contract is identical.
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    SERVICE=asr \
+    PORT=9000
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir \
+        "fastapi>=0.110" "uvicorn[standard]>=0.27" "python-multipart>=0.0.9" "websockets>=12.0"
+
+COPY docker/mock-asr/app.py /app/mock_asr.py
+COPY docker/mock-tts/app.py /app/mock_tts.py
+COPY docker/mock-entrypoint.sh /app/entrypoint.sh
+
+RUN chmod +x /app/entrypoint.sh \
+    && useradd --create-home --uid 10003 violet \
+    && chown -R violet:violet /app
+USER violet
+
+HEALTHCHECK --interval=20s --timeout=4s --start-period=10s --retries=3 \
+    CMD curl -fsS "http://localhost:${PORT}/health" || exit 1
+
+ENTRYPOINT ["/app/entrypoint.sh"]

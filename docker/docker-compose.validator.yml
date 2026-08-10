@@ -1,0 +1,36 @@
+# A Violet validator.
+#
+#   docker compose -f docker/docker-compose.validator.yml up -d
+#
+# CPU-only. Start with VALIDATOR_DRY_RUN=true to watch a few rounds of scoring
+# before the validator begins setting weights on chain.
+
+name: violet-validator
+
+services:
+  validator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.validator
+    image: violet/validator:1.4.0
+    ports:
+      # Public scoring dashboard (TDD 9.3).
+      - "8092:8092"
+    env_file:
+      - ../.env
+    environment:
+      VALIDATOR_DB_PATH: /data/validator.sqlite3
+      VALIDATOR_DASHBOARD_HOST: 0.0.0.0
+      VALIDATOR_DASHBOARD_PORT: "8092"
+    volumes:
+      - validator-data:/data
+      - ${BT_WALLET_DIR:-~/.bittensor}:/home/violet/.bittensor:ro
+      # A private evaluation corpus with real audio. Without it, word error rate
+      # is not measurable - see docs/VALIDATOR_GUIDE.md.
+      - ${VIOLET_EVALSET_DIR:-./evalset}:/evalset:ro
+    restart: unless-stopped
+
+volumes:
+  # Named volume, not a bind mount: this holds the seven-day scoring window and
+  # must survive container replacement.
+  validator-data:

@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Validator rolling window and router receipts. Never commit: these hold the
+# scoring history miners are paid on, and the receipts reveal traffic volume.
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Private evaluation corpora. A public corpus is an overfittable corpus.
+evalset/
+!violet/evalset/
+
+.pytest_cache/
+.coverage
+htmlcov/
+.DS_Store

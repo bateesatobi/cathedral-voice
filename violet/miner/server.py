@@ -1,0 +1,552 @@
+"""
+The Violet miner sidecar.
+
+Presents the standardised Violet API surface (see :mod:`violet.protocol`) and
+forwards every inference call to the official ASR/TTS containers on the same
+host. Because the paths and payloads are identical to what the Avoices backend
+already speaks, a miner is a drop-in replacement for the single-host servers
+Avoices uses today.
+
+Run with::
+
+    python -m violet.miner.run
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from contextlib import asynccontextmanager
+from typing import Dict, Optional
+
+import aiohttp
+import websockets
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+from ..config import MinerConfig
+from ..constants import SERVICE_ASR, SERVICE_TTS, SPEC_VERSION
+from ..protocol import (
+    HEADER_MINER_HOTKEY,
+    HEADER_MINER_UID,
+    PATH_ASR_STREAM_WS,
+    PATH_ASR_TRANSCRIBE,
+    PATH_CAPACITY,
+    PATH_HEALTH,
+    PATH_INFO,
+    PATH_TTS_CLONE,
+    PATH_TTS_STREAM,
+    PATH_TTS_STREAM_WS,
+    PATH_TTS_VOICES,
+    HealthReport,
+)
+from .gpu import GpuMonitor
+from .upstream import AtCapacity, Slots, UpstreamClient, UpstreamError
+
+logger = logging.getLogger("violet.miner.server")
+
+#: Headers that must not be copied verbatim from the upstream response.
+#: aiohttp has already decoded the body, so forwarding the original framing
+#: headers would make the client try to decode it a second time.
+_HOP_BY_HOP = {
+    "content-encoding",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+}
+
+
+class MinerState:
+    """Mutable runtime state shared by the routes."""
+
+    def __init__(self, config: MinerConfig, hotkey: str = "", uid: Optional[int] = None):
+        self.config = config
+        self.hotkey = hotkey
+        self.uid = uid
+        self.started_at = time.time()
+
+        self.gpu = GpuMonitor(poll_interval_s=config.gpu_poll_interval_s)
+        self.asr = UpstreamClient(
+            config.asr_upstream,
+            timeout_s=config.upstream_timeout_s,
+            health_timeout_s=config.health_timeout_s,
+            name="asr",
+        )
+        self.tts = UpstreamClient(
+            config.tts_upstream,
+            timeout_s=config.upstream_timeout_s,
+            health_timeout_s=config.health_timeout_s,
+            name="tts",
+        )
+        # Limits are resolved after the first GPU poll, so that an operator who
+        # sets nothing still gets sane admission control derived from hardware.
+        self.asr_slots = Slots(config.max_concurrent_asr, "asr")
+        self.tts_slots = Slots(config.max_concurrent_tts, "tts")
+
+    @property
+    def serves_asr(self) -> bool:
+        return SERVICE_ASR in self.config.services
+
+    @property
+    def serves_tts(self) -> bool:
+        return SERVICE_TTS in self.config.services
+
+    async def resolve_limits(self) -> None:
+        """Derive concurrency limits from detected hardware when unset."""
+        await self.gpu.refresh(force=True)
+        default_asr, default_tts = self.gpu.default_limits()
+        if self.config.max_concurrent_asr <= 0 and default_asr:
+            self.asr_slots.limit = default_asr
+            logger.info("ASR concurrency limit derived from hardware: %d", default_asr)
+        if self.config.max_concurrent_tts <= 0 and default_tts:
+            self.tts_slots.limit = default_tts
+            logger.info("TTS concurrency limit derived from hardware: %d", default_tts)
+
+    async def health(self) -> HealthReport:
+        upstreams: Dict[str, bool] = {}
+        checks = []
+        if self.serves_asr:
+            checks.append(("asr", self.asr.healthy()))
+        if self.serves_tts:
+            checks.append(("tts", self.tts.healthy()))
+        for (name, coro), ok in zip(checks, await asyncio.gather(*(c for _, c in checks))):
+            upstreams[name] = ok
+
+        capacity = await self.gpu.report(
+            max_concurrent_asr=self.asr_slots.limit,
+            max_concurrent_tts=self.tts_slots.limit,
+            active_asr=self.asr_slots.active,
+            active_tts=self.tts_slots.active,
+        )
+
+        if not upstreams:
+            status = "unhealthy"
+        elif all(upstreams.values()):
+            status = "ok"
+        elif any(upstreams.values()):
+            # One of two declared services is down. Reported as degraded rather
+            # than unhealthy so the router can keep using the half that works.
+            status = "degraded"
+        else:
+            status = "unhealthy"
+
+        return HealthReport(
+            status=status,
+            hotkey=self.hotkey,
+            spec_version=SPEC_VERSION,
+            services=list(self.config.services),
+            upstreams=upstreams,
+            capacity=capacity,
+            asr_image=self.config.asr_image,
+            tts_image=self.config.tts_image,
+        )
+
+    def identity_headers(self) -> Dict[str, str]:
+        headers = {HEADER_MINER_HOTKEY: self.hotkey}
+        if self.uid is not None:
+            headers[HEADER_MINER_UID] = str(self.uid)
+        return headers
+
+
+def _passthrough_headers(upstream_headers: Dict[str, str]) -> Dict[str, str]:
+    return {
+        key: value
+        for key, value in upstream_headers.items()
+        if key.lower() not in _HOP_BY_HOP
+    }
+
+
+def create_app(state: MinerState) -> FastAPI:
+    """Build the miner's FastAPI application."""
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        await state.asr.start()
+        await state.tts.start()
+        await state.resolve_limits()
+        for warning in state.gpu.warnings():
+            logger.warning("%s", warning)
+        logger.info(
+            "miner serving %s on behalf of %s",
+            ",".join(state.config.services),
+            state.hotkey or "<unregistered hotkey>",
+        )
+        try:
+            yield
+        finally:
+            await state.asr.close()
+            await state.tts.close()
+
+    app = FastAPI(
+        title="Violet Miner",
+        version=str(SPEC_VERSION),
+        description=(
+            "Standardised ASR/TTS serving interface for the Violet subnet. "
+            "Forwards to the official inference containers."
+        ),
+        lifespan=lifespan,
+    )
+    app.state.violet = state
+
+    # -- access control ----------------------------------------------------
+
+    def _authorize(authorization: Optional[str]) -> None:
+        """Enforce the optional shared secret on inference traffic.
+
+        Deliberately not applied to /health, /capacity or /violet/info:
+        validators must be able to evaluate a miner without holding its token,
+        otherwise a miner could dodge evaluation by rejecting unknown callers.
+        """
+        expected = state.config.access_token
+        if not expected:
+            return
+        if authorization != f"Bearer {expected}":
+            raise HTTPException(status_code=401, detail="invalid or missing bearer token")
+
+    # -- control plane -----------------------------------------------------
+
+    @app.get(PATH_HEALTH)
+    async def health() -> JSONResponse:
+        report = await state.health()
+        # 200 even when degraded: the body carries the detail, and a non-200
+        # would make generic infrastructure health checks pull the whole
+        # container while half of it is still serving.
+        return JSONResponse(report.to_dict(), headers=state.identity_headers())
+
+    @app.get(PATH_CAPACITY)
+    async def capacity() -> JSONResponse:
+        report = await state.gpu.report(
+            max_concurrent_asr=state.asr_slots.limit,
+            max_concurrent_tts=state.tts_slots.limit,
+            active_asr=state.asr_slots.active,
+            active_tts=state.tts_slots.active,
+        )
+        return JSONResponse(report.to_dict(), headers=state.identity_headers())
+
+    @app.get(PATH_INFO)
+    async def info() -> JSONResponse:
+        return JSONResponse(
+            {
+                "spec_version": SPEC_VERSION,
+                "hotkey": state.hotkey,
+                "uid": state.uid,
+                "services": list(state.config.services),
+                "public_endpoint": state.config.public_endpoint,
+                "asr_image": state.config.asr_image,
+                "tts_image": state.config.tts_image,
+                "gpu_counts": state.gpu.gpu_counts(),
+                "capacity_units": state.gpu.capacity_units(),
+                "rejected_gpus": state.gpu.rejected_gpus,
+                "warnings": state.gpu.warnings(),
+                "uptime_s": round(time.time() - state.started_at, 1),
+            },
+            headers=state.identity_headers(),
+        )
+
+    # -- ASR ---------------------------------------------------------------
+
+    @app.post(PATH_ASR_TRANSCRIBE)
+    async def transcribe(
+        file: UploadFile = File(...),
+        language: str = Form("eng"),
+        response_format: str = Form("json"),
+        authorization: Optional[str] = Header(None),
+    ):
+        """Batch transcription.
+
+        Contract matches ``ASRAPI/utils/utils.py:transcribe_single_file``:
+        multipart ``file``/``language``/``response_format``, JSON or text out.
+        """
+        _authorize(authorization)
+        if not state.serves_asr:
+            raise HTTPException(status_code=404, detail="this miner does not serve ASR")
+
+        payload = await file.read()
+        try:
+            async with state.asr_slots.acquire():
+                form = aiohttp.FormData()
+                form.add_field(
+                    "file",
+                    payload,
+                    filename=file.filename or "audio.wav",
+                    content_type=file.content_type or "application/octet-stream",
+                )
+                form.add_field("language", language)
+                form.add_field("response_format", response_format)
+                status, body, headers = await state.asr.post_multipart(
+                    PATH_ASR_TRANSCRIBE, form
+                )
+        except UpstreamError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+        return Response(
+            content=body,
+            status_code=status,
+            media_type=headers.get("Content-Type", "application/json"),
+            headers=state.identity_headers(),
+        )
+
+    @app.websocket(PATH_ASR_STREAM_WS)
+    async def realtime_transcribe(websocket: WebSocket, language: str = "eng"):
+        """Streaming ASR: binary PCM in, JSON partial transcripts out."""
+        if not state.serves_asr:
+            await websocket.close(code=1008, reason="ASR not served by this miner")
+            return
+        await websocket.accept()
+
+        target = f"{state.config.ws_base('asr')}{PATH_ASR_STREAM_WS}?language={language}"
+        try:
+            async with state.asr_slots.acquire():
+                await _bridge_websocket(websocket, target, binary_to_upstream=True)
+        except AtCapacity as exc:
+            await websocket.close(code=1013, reason=str(exc))
+        except WebSocketDisconnect:
+            logger.debug("client disconnected from realtime ASR")
+        except Exception as exc:
+            logger.warning("realtime ASR bridge failed: %s", exc)
+            await _safe_close(websocket, 1011)
+
+    # -- TTS ---------------------------------------------------------------
+
+    @app.post(PATH_TTS_STREAM)
+    async def tts_stream(request: Request, authorization: Optional[str] = Header(None)):
+        """Synthesis, streamed as raw PCM.
+
+        Contract matches ``ASRAPI/utils/tts_synthesis.py``: JSON body of
+        ``{text, speaker_id, temperature}``, PCM body out, framing carried in
+        the ``x-audio-*`` headers.
+        """
+        _authorize(authorization)
+        if not state.serves_tts:
+            raise HTTPException(status_code=404, detail="this miner does not serve TTS")
+
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="body must be JSON") from exc
+
+        if not (payload.get("text") or "").strip():
+            raise HTTPException(status_code=400, detail="'text' is required")
+
+        return await _proxy_stream(
+            state, state.tts, state.tts_slots, PATH_TTS_STREAM, json_payload=payload
+        )
+
+    @app.post(PATH_TTS_CLONE)
+    async def tts_clone(
+        text: str = Form(...),
+        reference_audio: UploadFile = File(...),
+        temperature: float = Form(0.7),
+        authorization: Optional[str] = Header(None),
+    ):
+        """Zero-shot voice cloning from an uploaded reference sample."""
+        _authorize(authorization)
+        if not state.serves_tts:
+            raise HTTPException(status_code=404, detail="this miner does not serve TTS")
+
+        audio = await reference_audio.read()
+        form = aiohttp.FormData()
+        form.add_field("text", text)
+        form.add_field("temperature", str(temperature))
+        form.add_field(
+            "reference_audio",
+            audio,
+            filename=reference_audio.filename or "reference.wav",
+            content_type=reference_audio.content_type or "application/octet-stream",
+        )
+        return await _proxy_stream(
+            state, state.tts, state.tts_slots, PATH_TTS_CLONE, data=form
+        )
+
+    @app.get(PATH_TTS_VOICES)
+    async def voices():
+        """Voice catalogue. Unauthenticated: it is a public capability listing."""
+        if not state.serves_tts:
+            raise HTTPException(status_code=404, detail="this miner does not serve TTS")
+        try:
+            status, body, headers = await state.tts.get(PATH_TTS_VOICES, timeout_s=10.0)
+        except UpstreamError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return Response(
+            content=body,
+            status_code=status,
+            media_type=headers.get("Content-Type", "application/json"),
+            headers=state.identity_headers(),
+        )
+
+    @app.websocket(PATH_TTS_STREAM_WS)
+    async def tts_stream_ws(websocket: WebSocket):
+        """Streaming TTS: JSON control frames in, binary audio frames out."""
+        if not state.serves_tts:
+            await websocket.close(code=1008, reason="TTS not served by this miner")
+            return
+        await websocket.accept()
+
+        target = f"{state.config.ws_base('tts')}{PATH_TTS_STREAM_WS}"
+        try:
+            async with state.tts_slots.acquire():
+                await _bridge_websocket(websocket, target, binary_to_upstream=False)
+        except AtCapacity as exc:
+            await websocket.close(code=1013, reason=str(exc))
+        except WebSocketDisconnect:
+            logger.debug("client disconnected from streaming TTS")
+        except Exception as exc:
+            logger.warning("streaming TTS bridge failed: %s", exc)
+            await _safe_close(websocket, 1011)
+
+    return app
+
+
+async def _proxy_stream(
+    state: MinerState,
+    upstream: UpstreamClient,
+    slots: Slots,
+    path: str,
+    *,
+    json_payload: Optional[dict] = None,
+    data: Optional[aiohttp.FormData] = None,
+) -> Response:
+    """Forward a streaming POST, holding a concurrency slot for its duration.
+
+    The slot is released by the generator's ``finally``, which runs when the
+    response body is exhausted or the client disconnects - so an abandoned
+    stream cannot leak capacity.
+    """
+    stream_started = asyncio.Event()
+    header_box: Dict[str, object] = {}
+
+    async def body():
+        try:
+            async with slots.acquire():
+                iterator = upstream.stream_post(
+                    path, json_payload=json_payload, data=data
+                )
+                async for head, chunk in iterator:
+                    if head is not None:
+                        header_box["status"], header_box["headers"] = head
+                        stream_started.set()
+                        continue
+                    if chunk:
+                        yield chunk
+        except AtCapacity as exc:
+            header_box["error"] = exc
+            stream_started.set()
+        except UpstreamError as exc:
+            header_box["error"] = exc
+            stream_started.set()
+        finally:
+            stream_started.set()
+
+    generator = body()
+    # Pull until the upstream status is known, buffering the first chunk so the
+    # status line is accurate rather than optimistically 200.
+    first_chunk: Optional[bytes] = None
+    try:
+        first_chunk = await generator.__anext__()
+    except StopAsyncIteration:
+        first_chunk = None
+
+    error = header_box.get("error")
+    if isinstance(error, UpstreamError):
+        await generator.aclose()
+        raise HTTPException(status_code=error.status, detail=str(error))
+
+    status = int(header_box.get("status", 200) or 200)
+    upstream_headers = _passthrough_headers(header_box.get("headers", {}) or {})  # type: ignore[arg-type]
+    upstream_headers.update(state.identity_headers())
+    media_type = upstream_headers.pop("Content-Type", None) or "audio/pcm"
+
+    async def replay():
+        if first_chunk:
+            yield first_chunk
+        async for chunk in generator:
+            yield chunk
+
+    return StreamingResponse(
+        replay(), status_code=status, media_type=media_type, headers=upstream_headers
+    )
+
+
+async def _bridge_websocket(
+    client_ws: WebSocket, target_url: str, *, binary_to_upstream: bool
+) -> None:
+    """Pipe a client WebSocket to the upstream container in both directions.
+
+    ``binary_to_upstream`` selects the ASR shape (client sends raw PCM frames)
+    versus the TTS shape (client sends JSON control frames). Both directions run
+    until either side closes; the first task to finish cancels the other so a
+    half-open socket cannot linger holding a concurrency slot.
+    """
+    async with websockets.connect(target_url, max_size=None) as upstream_ws:
+
+        async def client_to_upstream() -> None:
+            while True:
+                message = await client_ws.receive()
+                kind = message.get("type")
+                if kind == "websocket.disconnect":
+                    await upstream_ws.close()
+                    return
+                if message.get("bytes") is not None:
+                    await upstream_ws.send(message["bytes"])
+                elif message.get("text") is not None:
+                    text = message["text"]
+                    if binary_to_upstream:
+                        # An ASR client sending text is signalling end-of-audio
+                        # or a control command; forward it unchanged.
+                        await upstream_ws.send(text)
+                    else:
+                        # Validate JSON early so a malformed frame fails here
+                        # with a clear log rather than inside the model server.
+                        try:
+                            json.loads(text)
+                        except json.JSONDecodeError:
+                            logger.warning("dropping non-JSON control frame")
+                            continue
+                        await upstream_ws.send(text)
+
+        async def upstream_to_client() -> None:
+            async for message in upstream_ws:
+                if isinstance(message, (bytes, bytearray)):
+                    await client_ws.send_bytes(bytes(message))
+                else:
+                    await client_ws.send_text(message)
+
+        tasks = [
+            asyncio.create_task(client_to_upstream()),
+            asyncio.create_task(upstream_to_client()),
+        ]
+        try:
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            for task in done:
+                exc = task.exception()
+                if exc and not isinstance(exc, WebSocketDisconnect):
+                    raise exc
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _safe_close(websocket: WebSocket, code: int) -> None:
+    try:
+        await websocket.close(code=code)
+    except RuntimeError:
+        pass  # already closed

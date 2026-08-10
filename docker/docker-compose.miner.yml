@@ -1,0 +1,76 @@
+# A complete Violet miner: the two official inference containers plus the
+# sidecar that fronts them.
+#
+#   docker compose -f docker/docker-compose.miner.yml up -d
+#
+# Ships pointing at the SAMPLE images so the stack runs anywhere. To go live,
+# replace the `image:` on violet-asr and violet-tts with the official published
+# images and drop the `build:` block. Nothing else changes - the sample and
+# official images speak the same wire contract.
+
+name: violet-miner
+
+services:
+  violet-asr:
+    # Replace with the official image, e.g.
+    #   image: ghcr.io/phosaico/violet-asr:1.4.0
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.mock
+    image: violet/sample-asr:1.4.0
+    environment:
+      SERVICE: asr
+      PORT: "9000"
+    expose:
+      - "9000"
+    restart: unless-stopped
+    # Uncomment on a GPU host running the official image.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  violet-tts:
+    # Replace with the official image, e.g.
+    #   image: ghcr.io/phosaico/violet-tts:1.4.0
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.mock
+    image: violet/sample-tts:1.4.0
+    environment:
+      SERVICE: tts
+      PORT: "8080"
+    expose:
+      - "8080"
+    restart: unless-stopped
+
+  violet-miner:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.miner
+    image: violet/miner:1.4.0
+    depends_on:
+      violet-asr:
+        condition: service_healthy
+      violet-tts:
+        condition: service_healthy
+    ports:
+      - "8091:8091"
+    env_file:
+      - ../.env
+    environment:
+      MINER_ASR_UPSTREAM: http://violet-asr:9000
+      MINER_TTS_UPSTREAM: http://violet-tts:8080
+      MINER_HOST: 0.0.0.0
+      MINER_PORT: "8091"
+    volumes:
+      # The hotkey. Read-only: the sidecar signs with it but must never be able
+      # to modify or delete the keyfile.
+      - ${BT_WALLET_DIR:-~/.bittensor}:/home/violet/.bittensor:ro
+      # The host driver, so reported GPU models match the driver actually
+      # running rather than whatever the image was built against.
+      - /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro
+    restart: unless-stopped
