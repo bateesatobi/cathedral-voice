@@ -270,6 +270,48 @@ class ValidatorConfig:
     #: Dry run: evaluate and score, but never submit weights on chain.
     dry_run: bool = field(default_factory=lambda: _env_bool("VALIDATOR_DRY_RUN", False))
 
+    #: Post scored rounds to Cathedral publisher (SN39 violet_audio blend).
+    #: Cathedral validators do not ingest scores directly — only the publisher.
+    cathedral_scores_enabled: bool = field(
+        default_factory=lambda: _env_bool("CATHEDRAL_EXTERNAL_SCORES_ENABLED", False)
+        or _env_bool("CATHEDRAL_VOICE_SCORES_ENABLED", False)
+    )
+    cathedral_publisher_url: str = field(
+        default_factory=lambda: _env(
+            "CATHEDRAL_PUBLISHER_URL", "https://api.cathedral.computer"
+        )
+    )
+    cathedral_scores_token: str = field(
+        default_factory=lambda: _env("CATHEDRAL_EXTERNAL_SCORES_TOKEN")
+    )
+    cathedral_scores_hmac: str = field(
+        default_factory=lambda: _env("CATHEDRAL_EXTERNAL_SCORES_HMAC_SECRET")
+    )
+    cathedral_scores_netuid: int = field(
+        default_factory=lambda: _env_int("CATHEDRAL_EXTERNAL_SCORES_NETUID", 39)
+    )
+    cathedral_scores_dry_run: bool = field(
+        default_factory=lambda: _env_bool("CATHEDRAL_EXTERNAL_SCORES_DRY_RUN", False)
+    )
+    #: When true, still score locally but skip Violet-subnet set_weights (Cathedral-only).
+    cathedral_skip_local_weights: bool = field(
+        default_factory=lambda: _env_bool("CATHEDRAL_SKIP_LOCAL_WEIGHTS", False)
+    )
+
+    #: Colocate Cathedral thin SN39 duties (fetch signed feed → verify → set_weights).
+    cathedral_thin_enabled: bool = field(
+        default_factory=lambda: _env_bool("CATHEDRAL_THIN_ENABLED", False)
+    )
+    cathedral_thin_broadcast: bool = field(
+        default_factory=lambda: _env_bool("CATHEDRAL_THIN_BROADCAST", False)
+    )
+    cathedral_thin_interval_s: float = field(
+        default_factory=lambda: _env_float("CATHEDRAL_THIN_INTERVAL_S", 1500.0)
+    )
+    cathedral_thin_dry_run: bool = field(
+        default_factory=lambda: _env_bool("CATHEDRAL_THIN_DRY_RUN", True)
+    )
+
     def resolved_weights(self) -> PhaseWeights:
         """Return the active C/W/Q weights, normalised to sum to 1."""
         overrides = (self.weight_capacity, self.weight_work, self.weight_quality)

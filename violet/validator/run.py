@@ -76,6 +76,37 @@ class Validator:
         self._discovery = Discovery()
         self._evaluations: Dict[str, MinerEvaluation] = {}
         self._stop = asyncio.Event()
+        self._cathedral = None
+        self._thin = None
+        if self.config.cathedral_scores_enabled:
+            from ..cathedral import CathedralScoreClient, CathedralScoreClientConfig
+
+            self._cathedral = CathedralScoreClient(
+                CathedralScoreClientConfig(
+                    enabled=True,
+                    publisher_url=self.config.cathedral_publisher_url,
+                    token=self.config.cathedral_scores_token,
+                    hmac_secret=self.config.cathedral_scores_hmac,
+                    netuid=self.config.cathedral_scores_netuid,
+                    dry_run=self.config.cathedral_scores_dry_run or self.dashboard.dry_run,
+                )
+            )
+        if self.config.cathedral_thin_enabled:
+            from ..cathedral.thin_relay import config_from_env as thin_config_from_env
+
+            self._thin = thin_config_from_env()
+            self._thin.enabled = True
+            self._thin.broadcast = self.config.cathedral_thin_broadcast
+            # Broadcast implies not dry unless explicitly forced dry.
+            if self.config.cathedral_thin_broadcast and not self.config.cathedral_thin_dry_run:
+                self._thin.dry_run = False
+            else:
+                self._thin.dry_run = True
+            self._thin.interval_s = self.config.cathedral_thin_interval_s
+            self._thin.publisher_url = self.config.cathedral_publisher_url
+            # Sole SN39 writer: never let the voice path overwrite the signed blend.
+            if self._thin.broadcast and not self._thin.dry_run:
+                self.config.cathedral_skip_local_weights = True
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -93,9 +124,30 @@ class Validator:
         )
         if self.dashboard.dry_run:
             logger.warning("DRY RUN: scores are computed but no weights are submitted")
+        if self._cathedral:
+            logger.info(
+                "Cathedral voice scores ENABLED → %s (netuid %s)",
+                self.config.cathedral_publisher_url.rstrip("/")
+                + "/v1/external-scores/violet",
+                self.config.cathedral_scores_netuid,
+            )
+        if self._thin:
+            logger.info(
+                "Cathedral thin SN39 relay ENABLED → %s (broadcast=%s dry_run=%s)",
+                self._thin.feed_url,
+                self._thin.broadcast,
+                self._thin.dry_run,
+            )
+            if self.config.cathedral_skip_local_weights:
+                logger.warning(
+                    "sole SN39 writer mode: local Violet set_weights DISABLED "
+                    "(thin signed feed owns the chain vector)"
+                )
 
     async def stop(self) -> None:
         self._stop.set()
+        if self._cathedral:
+            await self._cathedral.close()
         if self.session:
             await self.session.close()
         if self.chain:
@@ -209,6 +261,34 @@ class Validator:
                 self.dashboard.errors.append(f"weights: {exc}")
             await self._sleep(interval_s)
 
+    async def thin_loop(self) -> None:
+        """Cathedral thin SN39 path — isolated from voice probing failures."""
+        if not self._thin:
+            return
+        from ..cathedral.thin_relay import ThinRelayError, run_thin_tick
+
+        # Stagger so the first voice eval can post scores before the first broadcast.
+        await self._sleep(min(60.0, self._thin.interval_s / 10.0))
+        while not self._stop.is_set():
+            try:
+                result = await run_thin_tick(
+                    self._thin, chain=self.chain, session=self.session
+                )
+                logger.info("thin SN39 tick: %s", {k: result.get(k) for k in (
+                    "ok", "mode", "vector_id", "n_mapped", "broadcast", "dry_run", "error"
+                ) if k in result or result.get(k) is not None})
+            except ThinRelayError as exc:
+                logger.error("thin SN39 tick failed (voice path continues): %s", exc)
+                self.dashboard.errors.append(f"thin: {exc}")
+            except Exception as exc:
+                logger.error(
+                    "thin SN39 tick crashed (voice path continues): %s",
+                    exc,
+                    exc_info=True,
+                )
+                self.dashboard.errors.append(f"thin: {exc}")
+            await self._sleep(self._thin.interval_s)
+
     async def _sleep(self, seconds: float) -> None:
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._stop.wait(), timeout=seconds)
@@ -295,11 +375,35 @@ class Validator:
         uids, weights = normalize_scores({s.uid: s.final for s in scores if s.uid is not None})
         logger.info("scored round: %s", describe(uids, weights))
 
+        if self._cathedral is not None:
+            try:
+                result = await self._cathedral.publish_miner_scores(
+                    scores,
+                    metadata={
+                        "phase": self.weights.name,
+                        "window_days": self.config.window_days,
+                        "violet_netuid": self.chain_config.netuid,
+                        "scorer": "cathedral-voice",
+                    },
+                )
+                if not result.get("ok"):
+                    logger.error(
+                        "cathedral score publish failed: %s",
+                        result.get("error") or result.get("body"),
+                    )
+            except Exception as exc:
+                logger.error("cathedral score publish error: %s", exc, exc_info=True)
+
         if self.dashboard.dry_run:
             logger.info("dry run: not submitting weights")
             return scores
 
-        if uids and await self.chain.set_weights(uids, weights):
+        if self.config.cathedral_skip_local_weights:
+            logger.info(
+                "CATHEDRAL_SKIP_LOCAL_WEIGHTS: skipping Violet set_weights "
+                "(Cathedral publisher owns SN39 vector)"
+            )
+        elif uids and await self.chain.set_weights(uids, weights):
             self.dashboard.last_weights_at = time.time()
             self.dashboard.last_weights_block = await self.chain.block()
 
@@ -320,6 +424,8 @@ class Validator:
             asyncio.create_task(self.work_loop(), name="work"),
             asyncio.create_task(self.weight_loop(), name="weights"),
         ]
+        if self._thin:
+            tasks.append(asyncio.create_task(self.thin_loop(), name="cathedral-thin"))
 
         if self.config.dashboard_enabled:
             app = create_dashboard(self.store, self.dashboard, self.evalset)

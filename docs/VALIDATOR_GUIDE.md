@@ -33,20 +33,22 @@ No GPU required. You need a private eval corpus with real audio for meaningful W
 ## Quick start
 
 ```bash
-cd violet-subnet
+cd cathedral-voice   # repo root
 cp .env.example .env
 
 # Offline (no chain) — after a miner is up on :8091
 ./violet/validator/start.sh test
 
-# On-chain
+# On-chain (dry-run first)
 ./violet/validator/start.sh prod
 ```
+
+For the full runbook (local, prod, and unified SN39 voice + thin relay), see the root [README.md](../README.md#validator--how-to-run) and [UNIFIED_SN39_VALIDATOR.md](UNIFIED_SN39_VALIDATOR.md).
 
 Or manually:
 
 ```bash
-pip install -e ".[chain,dev]"
+pip install -e ".[chain,cathedral,dev]"
 cp .env.example .env
 ```
 
