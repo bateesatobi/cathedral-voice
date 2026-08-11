@@ -20,14 +20,49 @@ Miners (ASR/TTS) ──► cathedral-voice validator ──► publisher (violet
 | **Publisher** (Cathedral) | Blend voice scores into the signed SN39 feed |
 | **Router** (optional) | Product backends can load-balance traffic across voice miners |
 
+**Networks:** mainnet **netuid 39** (`BT_NETWORK=finney`) · testnet **netuid 292** (`BT_NETWORK=test`)
+
+---
+
+## Install & run (numbered guides)
+
+Full step-by-step runbooks (clone → Bittensor → deps → register → run → verify):
+
+| Role | Guide | Steps |
+|------|-------|-------|
+| **Miner** | [docs/MINER_GUIDE.md](docs/MINER_GUIDE.md) | **1–13** — GPU host, Docker, `pip install -e ".[chain]"`, wallet, `.env`, inference, sidecar, qualify, register, announce |
+| **Validator** | [docs/VALIDATOR_GUIDE.md](docs/VALIDATOR_GUIDE.md) | **1–13** — Python/Docker, `pip install -e ".[chain,cathedral,dev]"`, evalset, dry-run, register, go live |
+
+**Dependencies:** no `requirements.txt` — install from `pyproject.toml`:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -U pip wheel
+pip install -e ".[chain]"              # miner (announce / register)
+pip install -e ".[chain,cathedral,dev]" # validator
+```
+
+**Quick copy-paste (mainnet miner, after clone):**
+
+```bash
+cp .env.example .env   # set BT_NETWORK=finney, wallet names
+pip install -e ".[chain]"
+./violet/miner/bootstrap.sh prod --no-follow
+python scripts/run_qualification.py http://127.0.0.1:8091
+btcli subnet register --netuid 39 --wallet.name … --wallet.hotkey … --subtensor.network finney
+python scripts/announce_endpoint.py
+```
+
+**Quick copy-paste (testnet):** same, but `BT_NETWORK=test`, `--netuid 292`, `--subtensor.network test`.
+
 ---
 
 ## Docs
 
 | Doc | Contents |
 |-----|----------|
-| [docs/MINER_GUIDE.md](docs/MINER_GUIDE.md) | Hardware rules, register, run miner |
-| [docs/VALIDATOR_GUIDE.md](docs/VALIDATOR_GUIDE.md) | Validator details, dry-run, evalset |
+| [docs/MINER_GUIDE.md](docs/MINER_GUIDE.md) | **Full miner runbook** (steps 1–13, testnet + mainnet) |
+| [docs/VALIDATOR_GUIDE.md](docs/VALIDATOR_GUIDE.md) | **Full validator runbook** (steps 1–13, testnet + mainnet) |
 | [docs/UNIFIED_SN39_VALIDATOR.md](docs/UNIFIED_SN39_VALIDATOR.md) | Voice + Cathedral thin SN39 in one process |
 | [docs/CATHEDRAL_EXTERNAL_SCORES.md](docs/CATHEDRAL_EXTERNAL_SCORES.md) | `POST /v1/external-scores/violet` contract |
 | [docs/INCENTIVE.md](docs/INCENTIVE.md) | Capacity / Work / Quality |
@@ -36,93 +71,51 @@ Miners (ASR/TTS) ──► cathedral-voice validator ──► publisher (violet
 
 ---
 
-## Miner — quick start
+## Miner — at a glance
 
-```bash
-cd cathedral-voice
-cp .env.example .env
+See **[MINER_GUIDE.md](docs/MINER_GUIDE.md)** for all 13 steps. Summary:
 
-# Real ASR (etoil) + TTS (Spark) — uses all host GPUs (split when both run)
-./violet/miner/stt_install.sh
-./violet/miner/tts_install.sh
+1. Prerequisites (GPU, Docker, NVIDIA driver, **NVIDIA Container Toolkit**)
+2. Clone repo
+3. `pip install -e ".[chain]"`
+4. `btcli` / Bittensor
+5. Create wallet
+6. Configure `.env` (`finney` → 39, `test` → 292)
+7. `./violet/miner/stt_install.sh` + `tts_install.sh`
+8. `./violet/miner/bootstrap.sh prod --no-follow`
+9. Local verify + `run_qualification.py`
+10. `btcli subnet register`
+11. `python scripts/announce_endpoint.py`
+12. Public `curl` check
+13. Ops (`status`, `logs`, `stop-all`)
 
-# Sidecar (installs inference automatically if ports are down)
-./violet/miner/start.sh prod --gpu
-
-./violet/miner/start.sh status|logs|stop
-```
-
-ASR upstream = **etoil-api** `:9090`. TTS upstream = **Spark** `:8002`.  
-See [MINER_GUIDE.md](docs/MINER_GUIDE.md). Netuids: mainnet **39** (`finney`), testnet **292** (`test`).
+ASR upstream = **etoil-api** `:9090`. TTS upstream = **Spark** `:8002`.
 
 ---
 
-## Validator — how to run
+## Validator — at a glance
 
-The validator does **voice work** (probe + score + optional Cathedral score POST) and can also do **Cathedral thin SN39 work** (fetch signed feed → verify → `set_weights` on netuid 39).
+See **[VALIDATOR_GUIDE.md](docs/VALIDATOR_GUIDE.md)** for all 13 steps. Summary:
 
-### 1. Install
+1. Docker (+ Python 3.10+)
+2. Clone repo
+3. `pip install -e ".[chain,cathedral,dev]"`
+4. `btcli`
+5. Create wallet
+6. Private evalset
+7. Configure `.env` (`VALIDATOR_DRY_RUN=true` first)
+8. `./violet/validator/start.sh test --miner http://…:8091`
+9. `btcli subnet register`
+10. `./violet/validator/start.sh prod`
+11. Set `VALIDATOR_DRY_RUN=false` when ready
+12. Optional Cathedral SN39 mode
+13. Ops + backup `VALIDATOR_DB_PATH`
 
-```bash
-cd cathedral-voice
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[chain,cathedral,dev]"
-cp .env.example .env
-```
+Unified SN39 details: [UNIFIED_SN39_VALIDATOR.md](docs/UNIFIED_SN39_VALIDATOR.md).
 
-### 2. Minimum `.env`
+---
 
-```bash
-BT_NETWORK=finney                 # → netuid 39 (use test → 292)
-BT_WALLET_NAME=my-coldkey
-BT_WALLET_HOTKEY=my-validator
-
-VIOLET_PHASE=launch
-VIOLET_SCORE_WINDOW_DAYS=7
-VALIDATOR_DB_PATH=./data/validator.sqlite3   # persistent disk
-VALIDATOR_EVALSET_PATH=/path/to/private/evalset
-VALIDATOR_DASHBOARD_PORT=8092
-VALIDATOR_DRY_RUN=true                       # start here
-
-# Organic work from PHOSAI / ASRAPI (optional but needed for Work score)
-VIOLET_WORK_REPORT_URL=https://api.voices.phosaico.com/violet/work-report
-VIOLET_WORK_REPORT_TOKEN=
-```
-
-### 3. Local / offline (no chain)
-
-Points at a miner HTTP endpoint (default host `:8091`):
-
-```bash
-./violet/validator/start.sh test
-./violet/validator/start.sh test --miner http://127.0.0.1:8091
-
-# or process:
-python -m violet.validator.run --dry-run
-```
-
-### 4. On-chain production (dry-run first)
-
-```bash
-# Edit .env: wallet, evalset, VALIDATOR_DRY_RUN=true
-./violet/validator/start.sh prod
-
-# Process form:
-python -m violet.validator.run --dry-run
-# when scores look sane:
-# VALIDATOR_DRY_RUN=false
-python -m violet.validator.run
-```
-
-Dashboard: [http://127.0.0.1:8092](http://127.0.0.1:8092) (`/api/overview`, `/api/scores`)
-
-```bash
-./violet/validator/start.sh status
-./violet/validator/start.sh logs
-./violet/validator/start.sh stop
-```
-
-### 5. Unified SN39 mode (voice + Cathedral thin)
+## Validator — advanced (loops & SN39)
 
 Use this when one process should **score voice miners** and **write the blended SN39 weight vector** (Cathedral compute/SAT miners + voice miners).
 
