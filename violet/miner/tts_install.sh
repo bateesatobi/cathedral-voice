@@ -49,10 +49,18 @@ err()  { echo -e "${RED}[tts_install error]${NC} $*" >&2; }
 
 wait_http() {
   local name="$1" url="$2" tries="${3:-90}"
+  # Optional 4th arg: "any" = any HTTP response counts (Spark has no /health).
+  local mode="${4:-ok}"
   log "Waiting for ${name} (${url}) up to $((tries * 2))s..."
-  local i restart_hits=0
+  local i restart_hits=0 code
   for ((i = 1; i <= tries; i++)); do
-    if curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
+    if [[ "$mode" == "any" ]]; then
+      code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 "$url" 2>/dev/null || echo "000")"
+      if [[ "$code" != "000" && "$code" != "" ]]; then
+        log "${name} is up (HTTP ${code})"
+        return 0
+      fi
+    elif curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
       log "${name} is up"
       return 0
     fi
@@ -80,18 +88,9 @@ wait_http() {
 
 smoke_tts() {
   local base="http://127.0.0.1:${TTS_HOST_PORT}"
-  log "Contract smoke: GET ${base}/health"
-  curl -fsS --max-time 10 "${base}/health" >/dev/null
+  log "Contract smoke: speech stream (this image may 404 on /health)"
 
   local code
-  code="$(curl -sS -o /tmp/tts_voices.json -w '%{http_code}' --max-time 30 \
-    "${base}/v1/audio/voices" 2>/dev/null || echo "000")"
-  if [[ "$code" == "200" ]]; then
-    log "Contract smoke: GET /v1/audio/voices → 200"
-  else
-    warn "GET /v1/audio/voices → HTTP ${code}"
-  fi
-
   code="$(curl -sS -o /tmp/tts_smoke.pcm -w '%{http_code}' --max-time 180 \
     -H 'Content-Type: application/json' \
     -d '{"text":"Hello cathedral voice smoke test.","speaker_id":"eng_female_1","temperature":0.7}' \
@@ -101,7 +100,15 @@ smoke_tts() {
     bytes="$(wc -c </tmp/tts_smoke.pcm | tr -d ' ')"
     log "Contract smoke: POST /v1/audio/speech/stream → 200 (${bytes} bytes)"
   else
-    warn "Speech stream smoke → HTTP ${code} (health OK; check model if scoring fails)"
+    warn "Speech stream smoke → HTTP ${code}"
+  fi
+
+  code="$(curl -sS -o /tmp/tts_voices.json -w '%{http_code}' --max-time 30 \
+    "${base}/v1/audio/voices" 2>/dev/null || echo "000")"
+  if [[ "$code" == "200" ]]; then
+    log "Contract smoke: GET /v1/audio/voices → 200"
+  else
+    warn "GET /v1/audio/voices → HTTP ${code} (optional on this image)"
   fi
 }
 
@@ -374,7 +381,9 @@ main() {
     --shm-size="${SHM_SIZE}" \
     "${IMAGE_TAG}"
 
-  wait_http "spark-tts" "http://127.0.0.1:${TTS_HOST_PORT}/health" "${TTS_READY_TRIES}" \
+  # This image often 404s on /health; treat any HTTP response as "process is up",
+  # then smoke via speech stream.
+  wait_http "spark-tts" "http://127.0.0.1:${TTS_HOST_PORT}/health" "${TTS_READY_TRIES}" "any" \
     || {
       err "TTS failed to become healthy. Diagnostics:"
       sudo docker logs --tail=80 "${CONTAINER_NAME}" 2>/dev/null || true
@@ -390,7 +399,7 @@ main() {
   echo "  TTS API         : http://127.0.0.1:${TTS_HOST_PORT}"
   echo "  Miner upstream  : MINER_TTS_UPSTREAM=http://127.0.0.1:${TTS_HOST_PORT}"
   echo "  TTS GPUs        : ${TTS_GPU_DEVICES}"
-  echo "  Health          : curl -fsS http://127.0.0.1:${TTS_HOST_PORT}/health"
+  echo "  Ready check     : curl speech stream ( /health may 404 on this image )"
   echo "  Stream test     : TTS_URL=http://127.0.0.1:${TTS_HOST_PORT} python ${SCRIPT_DIR}/tts_test_stream.py"
   echo "  Logs            : sudo docker logs -f ${CONTAINER_NAME}"
 }

@@ -154,7 +154,27 @@ port_is_listening() {
 
 port_health_ok() {
   local port="$1"
-  curl -fsS --max-time 2 "http://127.0.0.1:${port}/health" >/dev/null 2>&1
+  local path="${2:-/health}"
+  # Spark-TTS returns 404 on /health but is still serving; treat any HTTP
+  # response (not connection failure) as reachable.
+  local code
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 \
+    "http://127.0.0.1:${port}${path}" 2>/dev/null || echo "000")"
+  [[ "$code" != "000" && "$code" != "" ]]
+}
+
+tts_ready_ok() {
+  local port="${1:-${TTS_PORT:-8002}}"
+  # Prefer a real speech POST; fall back to "any HTTP response on the port".
+  local code
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+    -H 'Content-Type: application/json' \
+    -d '{"text":"ok","speaker_id":"eng_female_1","temperature":0.7}' \
+    "http://127.0.0.1:${port}/v1/audio/speech/stream" 2>/dev/null || echo "000")"
+  if [[ "$code" == "200" ]]; then
+    return 0
+  fi
+  port_health_ok "$port" "/"
 }
 
 # Pick first healthy /health among candidates; else first free; else first candidate.
@@ -213,7 +233,8 @@ resolve_service_ports() {
   else
     ASR_PORT="$(pick_port "${ASR_PORT:-}" "$asr_default" 9090 9091 9100)"
   fi
-  if port_health_ok "${TTS_PORT:-$tts_default}"; then
+  # Spark-TTS may 404 on /health — use speech readiness when possible.
+  if tts_ready_ok "${TTS_PORT:-$tts_default}" || port_health_ok "${TTS_PORT:-$tts_default}"; then
     TTS_PORT="${TTS_PORT:-$tts_default}"
   else
     TTS_PORT="$(pick_port "${TTS_PORT:-}" "$tts_default" 8002 8003 8080)"
@@ -544,7 +565,23 @@ start_stack() {
     wait_http "asr(etoil)" "http://127.0.0.1:${ASR_PORT}/health" 300
   fi
   if services_want_tts; then
-    wait_http "tts(spark)" "http://127.0.0.1:${TTS_PORT}/health" 450
+    # Spark frontend often has no /health — wait until speech stream answers.
+    local i tries=450
+    echo "==> waiting for tts(spark) speech readiness on :${TTS_PORT}"
+    for ((i = 1; i <= tries; i++)); do
+      if tts_ready_ok "${TTS_PORT}"; then
+        echo "    tts(spark) is up"
+        break
+      fi
+      if (( i == tries )); then
+        echo "ERROR: tts(spark) did not become ready on :${TTS_PORT}" >&2
+        exit 1
+      fi
+      if (( i % 30 == 0 )); then
+        echo "    still waiting (${i}/${tries})"
+      fi
+      sleep 2
+    done
   fi
 
   apply_concurrency_defaults 2>/dev/null || true
@@ -655,7 +692,11 @@ status_stack() {
   docker compose -f docker/docker-compose.miner.yml ps || true
   curl -fsS "http://127.0.0.1:${MINER_PORT:-8091}/health" 2>/dev/null && echo || echo "miner not reachable"
   curl -fsS "http://127.0.0.1:${ASR_PORT:-9090}/health" 2>/dev/null && echo "asr ok" || echo "asr not reachable"
-  curl -fsS "http://127.0.0.1:${TTS_PORT:-8002}/health" 2>/dev/null && echo "tts ok" || echo "tts not reachable"
+  if tts_ready_ok "${TTS_PORT:-8002}"; then
+    echo "tts ok"
+  else
+    echo "tts not reachable"
+  fi
 }
 
 logs_stack() {

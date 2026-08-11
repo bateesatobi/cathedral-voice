@@ -34,11 +34,15 @@ if [[ ",${SERVICES}," == *",asr,"* ]]; then
   check_get "asr" "http://127.0.0.1:${ASR_PORT}/health"
 fi
 if [[ ",${SERVICES}," == *",tts,"* ]]; then
-  check_get "tts" "http://127.0.0.1:${TTS_PORT}/health"
-  if curl -fsS --max-time 20 "http://127.0.0.1:${TTS_PORT}/v1/audio/voices" >/dev/null 2>&1; then
-    ok "tts GET /v1/audio/voices"
+  # Spark frontend may 404 on /health and /voices; speech stream is the contract.
+  code="$(curl -sS -o /tmp/tts_smoke.pcm -w '%{http_code}' --max-time 60 \
+    -H 'Content-Type: application/json' \
+    -d '{"text":"smoke","speaker_id":"eng_female_1","temperature":0.7}' \
+    "http://127.0.0.1:${TTS_PORT}/v1/audio/speech/stream" 2>/dev/null || echo "000")"
+  if [[ "$code" == "200" ]]; then
+    ok "tts POST /v1/audio/speech/stream"
   else
-    bad "tts GET /v1/audio/voices"
+    bad "tts POST /v1/audio/speech/stream (HTTP ${code})"
   fi
 fi
 
