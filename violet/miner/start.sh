@@ -557,11 +557,13 @@ seed_wallet_volume() {
   fi
 
   echo "==> seeding wallet volume ${vol} from ${src} (tar pipe; DinD-safe)"
+  # Miner image runs as uid 10001 (user violet). Keyfiles are often mode 600
+  # owned by root after seed — chown or the sidecar gets Permission denied.
   if ! tar -C "$src" -cf - . \
     | docker run --rm -i \
         -v "${vol}:/dst" \
         alpine:3.20 \
-        sh -c 'mkdir -p /dst && tar -C /dst -xf - && ls -la /dst && ls -la /dst/wallets 2>/dev/null || true'
+        sh -c 'mkdir -p /dst && tar -C /dst -xf - && chown -R 10001:10001 /dst && chmod -R u+rwX,go-rwx /dst && ls -la /dst/wallets'
   then
     echo "WARN: wallet seed failed — miner may start without a hotkey" >&2
     return 0
