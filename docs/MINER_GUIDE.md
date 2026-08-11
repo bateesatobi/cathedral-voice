@@ -1,167 +1,115 @@
-# Miner Guide — Violet (PHOSAI / Polaris)
+# Miner Guide — cathedral-voice
 
-Short guide: hardware rules, setup, registration, and how to run.
-
-Violet supplies **ASR + TTS** to the PHOSAI Avoices platform. Miners earn emissions by staying online on allowed GPUs and serving real routed traffic.
+Hardware rules, real ASR/TTS install, registration, and how to run.
 
 ---
 
-## Rules (read first)
+## Rules
 
-1. **Only these GPUs earn Capacity**
-
-| GPU | Units |
-|-----|-------|
-| A100 40 GB | 1.0× |
-| A100 80 GB | 1.6× |
-| H100 80 GB | 2.4× |
-| H100 NVL | 2.7× |
-| H200 | 3.5× |
-
-Anything else (RTX, L40S, …) → listed under `rejected_gpus`, earns **0**.
-
-2. **Public endpoint required** — validators and the PHOSAI router must reach you. No rotating tunnels.
-3. **Registration alone pays nothing** — you need qualification + online capacity + (later) work/quality.
-4. **One earning hotkey per coldkey** — extra UIDs under the same coldkey are zeroed.
-5. **Do not over-advertise concurrency** — accept only what you can serve; failures hurt Work and Quality.
-6. **Speak the Avoices wire contract** — miners are drop-in replacements for the old single hosts (`/transcribe`, `/realtime/transcribe`, TTS `/v1/...`).
+1. **Only these GPUs earn Capacity:** A100 40/80, H100 80, H100 NVL, H200.
+2. **Public endpoint required** — validators must reach `MINER_PUBLIC_ENDPOINT` (miner port, default `8091`).
+3. **ASR upstream is etoil-api** (`:9090`). **TTS upstream is Spark-TTS** (`:8002`).
+4. Install scripts use **all GPUs on the host** (or a split when both STT and TTS run together).
 
 ---
 
-## Quick start (local / mock — no GPU)
+## GPU planning
+
+`violet/miner/gpu_env.sh` → `plan_gpu_devices <stt|tts|both>`:
+
+| Mode | When | Assignment |
+|------|------|------------|
+| `stt` | `stt_install` alone / `MINER_SERVICES=asr` | **All** GPUs → ASR |
+| `tts` | `tts_install` alone / `MINER_SERVICES=tts` | **All** GPUs → TTS |
+| `both` | default `start.sh` (`asr,tts`) | Partition; **no idle** card |
+
+| Host GPUs (`both`) | STT | TTS |
+|--------------------|-----|-----|
+| 1 | GPU 0 (shared, TTS VRAM limited) | GPU 0 |
+| 2+ | first `ceil(N/2)` | remaining |
+
+Pin manually:
 
 ```bash
-cd violet-subnet
+STT_GPU_DEVICES_OVERRIDE=0,1 TTS_GPU_DEVICES_OVERRIDE=2,3 \
+  GPU_PLAN_MODE=both ./violet/miner/stt_install.sh
+```
+
+- **STT multi-GPU:** one speaches per GPU + nginx `least_conn` LB; etoil (`:9090`) fronts the LB.
+- **TTS:** `MODEL_POOL_SIZE` = assigned GPU count.
+- Full write-up: [`MINER_GPU_BOOTSTRAP_REPORT.md`](./MINER_GPU_BOOTSTRAP_REPORT.md)
+
+---
+
+## Install inference (real services)
+
+```bash
+cd cathedral-voice
+
+# ASR: speaches + etoil-api on :9090 (uses ALL GPUs when run alone)
+./violet/miner/stt_install.sh
+
+# TTS: Spark-TTS on :8002 (uses ALL GPUs when run alone)
+./violet/miner/tts_install.sh
+
+# Optional stream smoke test
+TTS_URL=http://127.0.0.1:8002 python violet/miner/tts_test_stream.py
+```
+
+No translation-secret prompts. HF token is set by the install scripts (override with `HF_TOKEN=…`).
+
+---
+
+## Run the miner sidecar
+
+```bash
 cp .env.example .env
-./violet/miner/start.sh test
-```
+# set wallet + MINER_PUBLIC_ENDPOINT (or let start.sh prompt)
 
-This builds the sample ASR/TTS + miner images, streams logs until healthy, and
-runs a qualification smoke test. Use `./violet/miner/start.sh stop` to tear down.
+# Recommended: fail-closed checklist (firewall + smoke + announce hints)
+./violet/miner/bootstrap.sh prod --no-follow
 
----
-
-## Production miner (GPU host)
-
-### 1. Configure
-
-```bash
-cd violet-subnet
-cp .env.example .env
-```
-
-Set at minimum:
-
-```bash
-VIOLET_NETUID=39           # mainnet; use 292 on testnet (or leave blank)
-BT_NETWORK=finney          # or test → auto-selects netuid 292
-BT_WALLET_NAME=my-coldkey
-BT_WALLET_HOTKEY=my-miner
-
-MINER_PUBLIC_ENDPOINT=http://YOUR_PUBLIC_IP:8091
-# or HTTPS DNS: https://miner.yourdomain.com
-MINER_SERVICES=asr,tts
-# Ports — leave blank for start.sh auto-detect, or set explicitly:
-# ASR_PORT=9000
-# TTS_PORT=8080
-# MINER_PORT=8091
-MINER_ASR_UPSTREAM=http://violet-asr:9000
-MINER_TTS_UPSTREAM=http://violet-tts:8080
-# Leave concurrency at 0 to auto-derive from GPUs
-MINER_MAX_CONCURRENT_ASR=0
-MINER_MAX_CONCURRENT_TTS=0
-```
-
-**Public IP vs chain axon:** set the public IP yourself; `start.sh` appends the auto-detected **miner** port. The on-chain axon is written *from* that URL — the chain does not invent your IP.
-
-**ASR / TTS ports:** they listen on different ports (defaults `9000` / `8080`). `start.sh` picks them automatically (already-healthy `/health`, else free port, else default) and wires `MINER_ASR_UPSTREAM` / `MINER_TTS_UPSTREAM`. Validators only dial the miner; the sidecar proxies to ASR/TTS.
-
-`./violet/miner/start.sh prod` prompts for public IP and prints the resolved ASR/TTS/miner ports.
-
-### 2. Run with Docker
-
-```bash
+# Or
 ./violet/miner/start.sh prod --gpu
-# or:
-docker compose -f docker/docker-compose.miner.yml up -d
+# start.sh installs STT/TTS if :9090 / :8002 are not healthy yet
+
+./violet/miner/start.sh status|logs|stop|stop-all
 ```
 
-Point `violet-asr` / `violet-tts` images at the **official** PHOSAI inference images for production (compose defaults may use samples).
-
-### 3. Verify before registering
+If ASR/TTS are already up:
 
 ```bash
-# Local
-curl -s http://localhost:8091/health | jq
-curl -s http://localhost:8091/capacity | jq
-curl -s http://localhost:8091/violet/info | jq
-
-# Qualification (cheap)
-python scripts/run_qualification.py http://localhost:8091
-
-# Full availability (30+ min) against PUBLIC URL
-python scripts/run_qualification.py https://miner.yourdomain.com --full-availability
+SKIP_INFERENCE_INSTALL=1 ./violet/miner/start.sh prod --gpu
 ```
 
-Confirm `capacity_units > 0` and no unexpected `rejected_gpus`.
-
-### 4. Register on-chain
+`.env` defaults:
 
 ```bash
-btcli subnet register \
-  --netuid 39 \
-  --wallet.name my-coldkey \
-  --wallet.hotkey my-miner
-# testnet: --netuid 292 and BT_NETWORK=test
+MINER_ASR_UPSTREAM=http://host.docker.internal:9090
+MINER_TTS_UPSTREAM=http://host.docker.internal:8002
+ASR_PORT=9090
+TTS_PORT=8002
+MINER_PORT=8091
 ```
 
-### 5. Announce endpoint
+---
 
-Miner announces on startup. Manual:
+## Register + announce
 
 ```bash
-python scripts/announce_endpoint.py --dry-run
+btcli subnet register --netuid 39 \
+  --wallet.name <coldkey> --wallet.hotkey <miner>
+
 python scripts/announce_endpoint.py
-python scripts/announce_endpoint.py --show
 ```
 
 ---
 
-## How you get paid (miner view)
-
-| Component | What it rewards |
-|-----------|-----------------|
-| **Capacity** | Accepted GPUs kept **online & healthy** (7-day mean) |
-| **Work** | Real ASR/TTS jobs from the PHOSAI router (not self-reported) |
-| **Quality** | Validator probes (accuracy / signal sanity) |
-
-Launch phase is Capacity-heavy. Stay up, pass probes, serve traffic cleanly.
-
-See [INCENTIVE.md](INCENTIVE.md) for weights and the 7-day window.
-
----
-
-## Useful commands
+## Verify
 
 ```bash
-# Logs
-docker compose -f docker/docker-compose.miner.yml logs -f miner
-
-# GPU inventory
-nvidia-smi
-curl -s localhost:8091/capacity | jq '.gpus,.capacity_units,.rejected_gpus'
-
-# Public scores (any validator dashboard)
-# http://<validator>:8092
+curl -fsS http://127.0.0.1:9090/health    # etoil
+curl -fsS http://127.0.0.1:8002/health    # spark
+curl -fsS http://127.0.0.1:8091/health    # miner sidecar
+curl -fsS http://127.0.0.1:8091/capacity
 ```
-
----
-
-## Checklist
-
-- [ ] Allowed GPU(s) mounted; `capacity_units > 0`
-- [ ] ASR/TTS upstreams healthy
-- [ ] Public HTTPS/HTTP endpoint stable
-- [ ] Qualification PASS (incl. availability on public URL)
-- [ ] Wallet registered + endpoint announced
-- [ ] Only one hotkey earning per coldkey

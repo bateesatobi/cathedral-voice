@@ -1,31 +1,8 @@
-# GPU host extras for the miner stack.
-#
-# Used by: violet/miner/start.sh prod
-#
-#   docker compose -f docker/docker-compose.miner.yml \
-#                  -f docker/docker-compose.miner.gpu.yml up -d
+# GPU visibility for the miner sidecar (nvidia-smi inventory / capacity).
+# ASR/TTS GPUs are assigned by stt_install.sh / tts_install.sh (gpu_env.sh).
 
 services:
-  violet-asr:
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
-  violet-tts:
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
   violet-miner:
-    # Same GPU visibility as ASR/TTS so nvidia-smi inventories every card.
     environment:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
@@ -38,5 +15,4 @@ services:
               capabilities: [gpu]
     volumes:
       - ${BT_WALLET_DIR:-${HOME}/.bittensor}:/home/violet/.bittensor:ro
-      # Toolkit usually injects nvidia-smi; keep host bind as a fallback.
       - /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro

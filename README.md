@@ -42,13 +42,18 @@ Miners (ASR/TTS) ──► cathedral-voice validator ──► publisher (violet
 cd cathedral-voice
 cp .env.example .env
 
-./violet/miner/start.sh test                 # local samples, no chain
-./violet/miner/start.sh prod --gpu           # production + GPUs
+# Real ASR (etoil) + TTS (Spark) — uses all host GPUs (split when both run)
+./violet/miner/stt_install.sh
+./violet/miner/tts_install.sh
+
+# Sidecar (installs inference automatically if ports are down)
+./violet/miner/start.sh prod --gpu
 
 ./violet/miner/start.sh status|logs|stop
 ```
 
-See [MINER_GUIDE.md](docs/MINER_GUIDE.md). Netuids: mainnet **39** (`BT_NETWORK=finney`), testnet **292** (`BT_NETWORK=test`).
+ASR upstream = **etoil-api** `:9090`. TTS upstream = **Spark** `:8002`.  
+See [MINER_GUIDE.md](docs/MINER_GUIDE.md). Netuids: mainnet **39** (`finney`), testnet **292** (`test`).
 
 ---
 

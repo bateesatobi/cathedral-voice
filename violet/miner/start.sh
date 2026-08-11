@@ -1,27 +1,25 @@
 #!/usr/bin/env bash
-# Start the Violet miner stack (ASR + TTS + miner sidecar).
+# Start the cathedral-voice miner (real ASR + TTS + sidecar).
 #
-# Usage (from repo root or anywhere):
-#   ./violet/miner/start.sh test      # local samples, --no-chain (default)
-#   ./violet/miner/start.sh prod      # chain-ready + wallet mount
-#   ./violet/miner/start.sh prod --gpu
-#   ./violet/miner/start.sh stop
-#   ./violet/miner/start.sh logs
-#   ./violet/miner/start.sh status
+# Usage:
+#   ./violet/miner/start.sh test|prod [--gpu] [--no-follow]
+#   ./violet/miner/start.sh stop|stop-all|status|logs
+#   ./violet/miner/bootstrap.sh test|prod   # fail-closed checklist wrapper
 #
-# Flow (test/prod):
-#   1. ensure .env
-#   2. auto-detect ASR / TTS / miner ports (or keep env overrides)
-#   3. prompt for public IP → builds MINER_PUBLIC_ENDPOINT
-#   4. build images + start containers
-#   5. stream logs until healthy, qualification smoke, follow logs
+# Flow:
+#   1. ensure .env + public endpoint
+#   2. plan GPUs from MINER_SERVICES (solo → ALL GPUs; both → full partition)
+#   3. stt_install.sh → etoil-api :9090 (+ speaches + LB when multi-GPU)
+#   4. tts_install.sh → Spark-TTS :8002 (pool = GPU count)
+#   5. auto-tune MINER_MAX_CONCURRENT_* from GPU counts (if unset/0)
+#   6. start miner sidecar → proxies to those upstreams
+#   7. contract smoke (+ optional firewall / announce hints)
 #
-# Ports:
-#   ASR and TTS listen on different ports (defaults 9000 / 8080). The script
-#   detects whatever is already healthy on the host, else uses defaults / next
-#   free ports, then wires MINER_ASR_UPSTREAM / MINER_TTS_UPSTREAM.
-#   Validators dial the miner sidecar only (MINER_PUBLIC_ENDPOINT = public IP
-#   + miner port). The miner proxies to ASR/TTS on the detected ports.
+# Upstream defaults:
+#   MINER_ASR_UPSTREAM=http://host.docker.internal:9090   # etoil-api
+#   MINER_TTS_UPSTREAM=http://host.docker.internal:8002   # Spark-TTS
+#
+# SKIP_INFERENCE_INSTALL=1 to only start the sidecar (ASR/TTS already running).
 
 set -euo pipefail
 
@@ -173,65 +171,174 @@ docker_published_port() {
   return 1
 }
 
-# ASR / TTS / miner listen on different ports. Detect running services, else
-# defaults, then wire upstream URLs the miner sidecar will use.
+# ASR = etoil-api (:9090), TTS = Spark (:8002), miner sidecar (:8091).
 resolve_service_ports() {
   local mode="$1"
-  local asr_default=9000 tts_default=8080 miner_default=8091
-  local asr_from_docker="" tts_from_docker="" miner_from_docker=""
+  local asr_default=9090 tts_default=8002 miner_default=8091
+  local miner_from_docker=""
 
   compose_files_for "$mode"
-
-  # Prefer ports already published by a previous compose run.
-  asr_from_docker="$(docker_published_port violet-asr "${ASR_PORT:-$asr_default}" || true)"
-  tts_from_docker="$(docker_published_port violet-tts "${TTS_PORT:-$tts_default}" || true)"
   miner_from_docker="$(docker_published_port violet-miner "${MINER_PORT:-$miner_default}" || true)"
 
-  # Env / .env wins; else docker published; else probe health / free ports.
-  ASR_PORT="$(pick_port "${ASR_PORT:-${MOCK_ASR_PORT:-$asr_from_docker}}" \
-    "$asr_default" 9001 9002 9100)"
-  TTS_PORT="$(pick_port "${TTS_PORT:-${MOCK_TTS_PORT:-$tts_from_docker}}" \
-    "$tts_default" 8081 8082 8180)"
+  # Prefer already-healthy real services on the host.
+  if port_health_ok "${ASR_PORT:-$asr_default}"; then
+    ASR_PORT="${ASR_PORT:-$asr_default}"
+  else
+    ASR_PORT="$(pick_port "${ASR_PORT:-}" "$asr_default" 9090 9091 9100)"
+  fi
+  if port_health_ok "${TTS_PORT:-$tts_default}"; then
+    TTS_PORT="${TTS_PORT:-$tts_default}"
+  else
+    TTS_PORT="$(pick_port "${TTS_PORT:-}" "$tts_default" 8002 8003 8080)"
+  fi
   MINER_PORT="$(pick_port "${MINER_PORT:-$miner_from_docker}" \
     "$miner_default" 8092 8093 8191)"
 
-  # Host publish aliases used by compose test overlay.
-  MOCK_ASR_PORT="$ASR_PORT"
-  MOCK_TTS_PORT="$TTS_PORT"
+  # Sidecar in Docker reaches host services via host.docker.internal.
+  # Process-mode / host networking can use 127.0.0.1 instead.
+  local asr_host tts_host
+  asr_host="${MINER_ASR_HOST:-host.docker.internal}"
+  tts_host="${MINER_TTS_HOST:-host.docker.internal}"
 
-  # Inside the compose network the miner reaches ASR/TTS by service name.
-  # If a healthy ASR/TTS is already on the host and not our container ports
-  # path, still prefer docker DNS for the stack we are about to start.
-  MINER_ASR_UPSTREAM="${MINER_ASR_UPSTREAM:-http://violet-asr:${ASR_PORT}}"
-  MINER_TTS_UPSTREAM="${MINER_TTS_UPSTREAM:-http://violet-tts:${TTS_PORT}}"
+  MINER_ASR_UPSTREAM="${MINER_ASR_UPSTREAM:-http://${asr_host}:${ASR_PORT}}"
+  MINER_TTS_UPSTREAM="${MINER_TTS_UPSTREAM:-http://${tts_host}:${TTS_PORT}}"
 
-  # If upstream was a stale hardcoded default, refresh to detected ports.
+  # Refresh stale mock / old compose defaults.
   case "$MINER_ASR_UPSTREAM" in
-    http://violet-asr:*|http://127.0.0.1:*|http://localhost:*)
-      MINER_ASR_UPSTREAM="http://violet-asr:${ASR_PORT}"
+    *violet-asr*|*sample-asr*)
+      MINER_ASR_UPSTREAM="http://${asr_host}:${ASR_PORT}"
       ;;
   esac
   case "$MINER_TTS_UPSTREAM" in
-    http://violet-tts:*|http://127.0.0.1:*|http://localhost:*)
-      MINER_TTS_UPSTREAM="http://violet-tts:${TTS_PORT}"
+    *violet-tts*|*sample-tts*)
+      MINER_TTS_UPSTREAM="http://${tts_host}:${TTS_PORT}"
       ;;
   esac
 
-  export ASR_PORT TTS_PORT MINER_PORT MOCK_ASR_PORT MOCK_TTS_PORT
+  export ASR_PORT TTS_PORT MINER_PORT
   export MINER_ASR_UPSTREAM MINER_TTS_UPSTREAM
+  export ETOIL_HOST_PORT="$ASR_PORT"
+  export TTS_HOST_PORT="$TTS_PORT"
 
   upsert_env_var "ASR_PORT" "$ASR_PORT" .env
   upsert_env_var "TTS_PORT" "$TTS_PORT" .env
   upsert_env_var "MINER_PORT" "$MINER_PORT" .env
-  upsert_env_var "MOCK_ASR_PORT" "$ASR_PORT" .env
-  upsert_env_var "MOCK_TTS_PORT" "$TTS_PORT" .env
   upsert_env_var "MINER_ASR_UPSTREAM" "$MINER_ASR_UPSTREAM" .env
   upsert_env_var "MINER_TTS_UPSTREAM" "$MINER_TTS_UPSTREAM" .env
 
   echo "==> service ports"
-  echo "    ASR   : ${ASR_PORT}  (upstream ${MINER_ASR_UPSTREAM})"
-  echo "    TTS   : ${TTS_PORT}  (upstream ${MINER_TTS_UPSTREAM})"
-  echo "    miner : ${MINER_PORT}  (public announce uses this port)"
+  echo "    ASR (etoil-api) : ${ASR_PORT}  → ${MINER_ASR_UPSTREAM}"
+  echo "    TTS (Spark)     : ${TTS_PORT}  → ${MINER_TTS_UPSTREAM}"
+  echo "    miner sidecar   : ${MINER_PORT}  (public announce)"
+}
+
+services_want_asr() {
+  local s="${MINER_SERVICES:-asr,tts}"
+  [[ ",${s}," == *",asr,"* ]]
+}
+
+services_want_tts() {
+  local s="${MINER_SERVICES:-asr,tts}"
+  [[ ",${s}," == *",tts,"* ]]
+}
+
+gpu_plan_mode_for_services() {
+  local asr=0 tts=0
+  services_want_asr && asr=1
+  services_want_tts && tts=1
+  if [[ $asr -eq 1 && $tts -eq 1 ]]; then
+    echo both
+  elif [[ $asr -eq 1 ]]; then
+    echo stt
+  elif [[ $tts -eq 1 ]]; then
+    echo tts
+  else
+    echo both
+  fi
+}
+
+apply_concurrency_defaults() {
+  local miner_dir="$ROOT/violet/miner"
+  # shellcheck source=gpu_env.sh
+  source "${miner_dir}/gpu_env.sh"
+  local asr_c tts_c
+  read -r asr_c tts_c <<<"$(suggest_concurrency)"
+  if [[ "${MINER_MAX_CONCURRENT_ASR:-0}" == "0" ]]; then
+    MINER_MAX_CONCURRENT_ASR="$asr_c"
+    upsert_env_var "MINER_MAX_CONCURRENT_ASR" "$asr_c" .env
+  fi
+  if [[ "${MINER_MAX_CONCURRENT_TTS:-0}" == "0" ]]; then
+    MINER_MAX_CONCURRENT_TTS="$tts_c"
+    upsert_env_var "MINER_MAX_CONCURRENT_TTS" "$tts_c" .env
+  fi
+  export MINER_MAX_CONCURRENT_ASR MINER_MAX_CONCURRENT_TTS
+  echo "==> concurrency ASR=${MINER_MAX_CONCURRENT_ASR} TTS=${MINER_MAX_CONCURRENT_TTS} (from GPU plan; override in .env)"
+}
+
+open_miner_firewall() {
+  local port="${MINER_PORT:-8091}"
+  if [[ "${OPEN_FIREWALL:-1}" != "1" ]]; then
+    return 0
+  fi
+  if command -v ufw >/dev/null 2>&1 && sudo -n ufw status 2>/dev/null | grep -qi "Status: active"; then
+    echo "==> ufw allow ${port}/tcp"
+    sudo -n ufw allow "${port}/tcp" || true
+  elif command -v firewall-cmd >/dev/null 2>&1 && sudo -n firewall-cmd --state 2>/dev/null | grep -qi running; then
+    echo "==> firewalld allow ${port}/tcp"
+    sudo -n firewall-cmd --permanent --add-port="${port}/tcp" || true
+    sudo -n firewall-cmd --reload || true
+  else
+    echo "==> ensure cloud SG / firewall allows public TCP ${port}"
+  fi
+}
+
+ensure_inference_stacks() {
+  local miner_dir="$ROOT/violet/miner"
+  local plan_mode
+  # shellcheck source=gpu_env.sh
+  source "${miner_dir}/gpu_env.sh"
+  plan_mode="$(gpu_plan_mode_for_services)"
+  export GPU_PLAN_MODE="$plan_mode"
+  plan_gpu_devices "$plan_mode"
+  export GPU_PLAN_LOCKED=1
+  echo "==> GPU plan mode=${plan_mode} count=${GPU_COUNT:-?} STT=[${STT_GPU_DEVICES:-}] TTS=[${TTS_GPU_DEVICES:-}]"
+  if [[ "${GPU_COUNT:-0}" -ge 1 ]]; then
+    assert_no_idle_gpus "${GPU_COUNT}" \
+      "${STT_GPU_DEVICES:-}" "${TTS_GPU_DEVICES:-}" \
+      || echo "WARN: idle GPU detected in plan" >&2
+  fi
+
+  if services_want_asr; then
+    if ! port_health_ok "${ASR_PORT}"; then
+      echo "==> installing / starting STT (etoil-api + speaches, all STT GPUs)"
+      GPU_PLAN_MODE="$plan_mode" GPU_PLAN_LOCKED=1 \
+        ETOIL_HOST_PORT="${ASR_PORT}" \
+        STT_GPU_DEVICES="${STT_GPU_DEVICES}" \
+        TTS_GPU_DEVICES="${TTS_GPU_DEVICES}" \
+        "${miner_dir}/stt_install.sh"
+    else
+      echo "==> ASR already healthy on :${ASR_PORT}"
+    fi
+  else
+    echo "==> MINER_SERVICES excludes asr — skip STT"
+  fi
+
+  if services_want_tts; then
+    if ! port_health_ok "${TTS_PORT}"; then
+      echo "==> installing / starting TTS (Spark, all TTS GPUs)"
+      GPU_PLAN_MODE="$plan_mode" GPU_PLAN_LOCKED=1 \
+        TTS_HOST_PORT="${TTS_PORT}" \
+        STT_GPU_DEVICES="${STT_GPU_DEVICES}" \
+        TTS_GPU_DEVICES="${TTS_GPU_DEVICES}" \
+        "${miner_dir}/tts_install.sh"
+    else
+      echo "==> TTS already healthy on :${TTS_PORT}"
+    fi
+  else
+    echo "==> MINER_SERVICES excludes tts — skip TTS"
+  fi
+
+  apply_concurrency_defaults
 }
 
 # Best practice: YOU choose the public IP/DNS. The chain axon is written from
@@ -387,41 +494,65 @@ start_stack() {
   prompt_public_endpoint "$mode"
   export MINER_PUBLIC_ENDPOINT="${MINER_PUBLIC_ENDPOINT:-http://127.0.0.1:${MINER_PORT}}"
 
-  echo "==> building miner images ($mode)"
+  if [[ "${SKIP_INFERENCE_INSTALL:-0}" != "1" ]]; then
+    ensure_inference_stacks
+  else
+    echo "==> SKIP_INFERENCE_INSTALL=1 — expecting ASR :${ASR_PORT} and TTS :${TTS_PORT}"
+    # Still plan GPUs so concurrency defaults match the host.
+    # shellcheck source=gpu_env.sh
+    source "$ROOT/violet/miner/gpu_env.sh"
+    plan_gpu_devices "$(gpu_plan_mode_for_services)"
+    apply_concurrency_defaults
+  fi
+
+  echo "==> waiting for inference health (long window for first model pull)"
+  if services_want_asr; then
+    wait_http "asr(etoil)" "http://127.0.0.1:${ASR_PORT}/health" 300
+  fi
+  if services_want_tts; then
+    wait_http "tts(spark)" "http://127.0.0.1:${TTS_PORT}/health" 450
+  fi
+
+  apply_concurrency_defaults 2>/dev/null || true
+  open_miner_firewall
+
+  echo "==> building miner sidecar ($mode)"
   "${COMPOSE[@]}" build
 
-  echo "==> starting miner stack"
+  echo "==> starting miner sidecar"
   "${COMPOSE[@]}" up -d --remove-orphans
 
-  echo "==> streaming startup logs (20s)"
+  echo "==> streaming startup logs (15s)"
   "${COMPOSE[@]}" logs -f --tail=20 &
   local log_pid=$!
   trap 'kill '"$log_pid"' 2>/dev/null || true' EXIT
-  sleep 20
+  sleep 15
   kill "$log_pid" 2>/dev/null || true
   wait "$log_pid" 2>/dev/null || true
   trap - EXIT
 
   show_boot_logs
-
-  # Health via published ports / compose health.
-  echo "==> waiting for docker health"
   "${COMPOSE[@]}" up -d --wait || true
 
-  wait_http "asr" "http://127.0.0.1:${ASR_PORT}/health" 30 || \
-    echo "    (ASR host port may be unpublished in prod; continuing)"
-  wait_http "tts" "http://127.0.0.1:${TTS_PORT}/health" 30 || \
-    echo "    (TTS host port may be unpublished in prod; continuing)"
   wait_http "miner" "http://127.0.0.1:${MINER_PORT}/health" 60
 
   echo "==> miner /health"
   curl -fsS "http://127.0.0.1:${MINER_PORT}/health" | tee /tmp/violet-miner-health.json
   echo
 
+  if [[ -x "$ROOT/violet/miner/smoke_contract.sh" ]] || [[ -f "$ROOT/violet/miner/smoke_contract.sh" ]]; then
+    echo "==> contract smoke"
+    ASR_PORT="$ASR_PORT" TTS_PORT="$TTS_PORT" MINER_PORT="$MINER_PORT" \
+      MINER_SERVICES="${MINER_SERVICES:-asr,tts}" \
+      bash "$ROOT/violet/miner/smoke_contract.sh" || \
+      echo "    contract smoke reported issues; check logs before registering"
+  fi
+
   if [[ -f scripts/run_qualification.py ]]; then
     echo "==> running qualification smoke"
     if command -v python3 >/dev/null 2>&1; then
-      python3 scripts/run_qualification.py "http://127.0.0.1:${MINER_PORT}" || \
+      python3 scripts/run_qualification.py "http://127.0.0.1:${MINER_PORT}" \
+        --services "${MINER_SERVICES:-asr,tts}" || \
         echo "    qualification reported issues (see above); miner is still serving"
     else
       echo "    python3 not found; skip qualification"
@@ -433,15 +564,18 @@ start_stack() {
   echo " Miner READY"
   echo "   local miner : http://127.0.0.1:${MINER_PORT}/health"
   echo "   public      : ${MINER_PUBLIC_ENDPOINT}"
-  echo "   ASR port    : ${ASR_PORT}  (upstream ${MINER_ASR_UPSTREAM})"
-  echo "   TTS port    : ${TTS_PORT}  (upstream ${MINER_TTS_UPSTREAM})"
+  echo "   ASR etoil   : http://127.0.0.1:${ASR_PORT}  (${MINER_ASR_UPSTREAM})"
+  echo "   TTS spark   : http://127.0.0.1:${TTS_PORT}  (${MINER_TTS_UPSTREAM})"
   echo "   mode        : $mode"
-  echo "   netuid      : mainnet 39 / testnet 292 (from BT_NETWORK)"
   echo "   stop        : ./violet/miner/start.sh stop"
+  echo "   stop-all    : ./violet/miner/start.sh stop-all   # sidecar + ASR + TTS"
   if ! is_local_endpoint "${MINER_PUBLIC_ENDPOINT}"; then
     echo
     echo " Verify from outside this host:"
     echo "   curl -fsS ${MINER_PUBLIC_ENDPOINT}/health"
+    echo " Announce (after btcli register):"
+    echo "   python scripts/announce_endpoint.py --dry-run"
+    echo "   python scripts/announce_endpoint.py"
   fi
   echo "============================================================"
   echo
@@ -463,13 +597,31 @@ stop_stack() {
     -f docker/docker-compose.miner.prod.yml \
     -f docker/docker-compose.miner.gpu.yml down --remove-orphans 2>/dev/null || true
   docker compose -f docker/docker-compose.miner.yml down --remove-orphans 2>/dev/null || true
-  echo "==> miner stack stopped"
+  echo "==> miner sidecar stopped"
+}
+
+stop_all_stacks() {
+  stop_stack
+  local stt_compose="$ROOT/violet/miner/stt-stack/docker-compose.yml"
+  if [[ -f "$stt_compose" ]]; then
+    echo "==> stopping STT stack"
+    docker compose -f "$stt_compose" down --remove-orphans 2>/dev/null || true
+  fi
+  local tts_name="${TTS_CONTAINER_NAME:-cathedral-spark-tts}"
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Eq "^${tts_name}\$"; then
+    echo "==> stopping TTS ${tts_name}"
+    docker stop "$tts_name" 2>/dev/null || true
+    docker rm "$tts_name" 2>/dev/null || true
+  fi
+  echo "==> miner + inference stacks stopped"
 }
 
 status_stack() {
   need_docker
   docker compose -f docker/docker-compose.miner.yml ps || true
   curl -fsS "http://127.0.0.1:${MINER_PORT:-8091}/health" 2>/dev/null && echo || echo "miner not reachable"
+  curl -fsS "http://127.0.0.1:${ASR_PORT:-9090}/health" 2>/dev/null && echo "asr ok" || echo "asr not reachable"
+  curl -fsS "http://127.0.0.1:${TTS_PORT:-8002}/health" 2>/dev/null && echo "tts ok" || echo "tts not reachable"
 }
 
 logs_stack() {
@@ -501,6 +653,7 @@ done
 case "$MODE" in
   test|local|prod|production) start_stack "$MODE" ;;
   stop|down) stop_stack ;;
+  stop-all) stop_all_stacks ;;
   status) status_stack ;;
   logs) logs_stack "$@" ;;
   -h|--help|help) usage ;;

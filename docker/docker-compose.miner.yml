@@ -1,86 +1,35 @@
-# A complete Violet miner: the two official inference containers plus the
-# sidecar that fronts them.
+# cathedral-voice miner sidecar only.
+#
+# ASR (etoil-api) and TTS (Spark) are installed on the host by:
+#   ./violet/miner/stt_install.sh
+#   ./violet/miner/tts_install.sh
+#
+# The sidecar proxies public traffic to those upstreams.
 #
 #   docker compose -f docker/docker-compose.miner.yml up -d
-#
-# Ships pointing at the SAMPLE images so the stack runs anywhere. To go live,
-# replace the `image:` on violet-asr and violet-tts with the official published
-# images and drop the `build:` block. Nothing else changes - the sample and
-# official images speak the same wire contract.
-#
-# Ports (set by violet/miner/start.sh or .env):
-#   ASR_PORT   default 9000
-#   TTS_PORT   default 8080
-#   MINER_PORT default 8091
 
 name: violet-miner
 
 services:
-  violet-asr:
-    # Replace with the official image, e.g.
-    #   image: ghcr.io/phosaico/violet-asr:1.4.0
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.mock
-    image: violet/sample-asr:1.4.0
-    environment:
-      SERVICE: asr
-      PORT: "${ASR_PORT:-9000}"
-    expose:
-      - "${ASR_PORT:-9000}"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:$${PORT}/health"]
-      interval: 10s
-      timeout: 4s
-      retries: 12
-      start_period: 10s
-    restart: unless-stopped
-
-  violet-tts:
-    # Replace with the official image, e.g.
-    #   image: ghcr.io/phosaico/violet-tts:1.4.0
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.mock
-    image: violet/sample-tts:1.4.0
-    environment:
-      SERVICE: tts
-      PORT: "${TTS_PORT:-8080}"
-    expose:
-      - "${TTS_PORT:-8080}"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:$${PORT}/health"]
-      interval: 10s
-      timeout: 4s
-      retries: 12
-      start_period: 10s
-    restart: unless-stopped
-
   violet-miner:
     build:
       context: ..
       dockerfile: docker/Dockerfile.miner
     image: violet/miner:1.4.0
-    depends_on:
-      violet-asr:
-        condition: service_healthy
-      violet-tts:
-        condition: service_healthy
     ports:
       - "${MINER_PORT:-8091}:${MINER_PORT:-8091}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - path: ../.env
         required: false
     environment:
-      MINER_ASR_UPSTREAM: ${MINER_ASR_UPSTREAM:-http://violet-asr:${ASR_PORT:-9000}}
-      MINER_TTS_UPSTREAM: ${MINER_TTS_UPSTREAM:-http://violet-tts:${TTS_PORT:-8080}}
+      # etoil-api (ASR) and Spark-TTS on the host — see stt_install / tts_install
+      MINER_ASR_UPSTREAM: ${MINER_ASR_UPSTREAM:-http://host.docker.internal:9090}
+      MINER_TTS_UPSTREAM: ${MINER_TTS_UPSTREAM:-http://host.docker.internal:8002}
       MINER_HOST: 0.0.0.0
       MINER_PORT: "${MINER_PORT:-8091}"
       MINER_PUBLIC_ENDPOINT: ${MINER_PUBLIC_ENDPOINT:-http://127.0.0.1:${MINER_PORT:-8091}}
-      ASR_PORT: "${ASR_PORT:-9000}"
-      TTS_PORT: "${TTS_PORT:-8080}"
-    # Wallet / nvidia mounts are added by docker-compose.miner.prod.yml
-    # and docker-compose.miner.gpu.yml (see violet/miner/start.sh).
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:$${MINER_PORT}/health"]
       interval: 10s

@@ -1,29 +1,15 @@
-# Local / laptop overrides for the miner stack (no GPU, no chain).
+# Local / laptop overlay for the miner sidecar (no chain).
 #
-# Used by: violet/miner/start.sh test
-#
-#   docker compose -f docker/docker-compose.miner.yml \
-#                  -f docker/docker-compose.miner.test.yml up -d
-#
-# Publishes ASR/TTS host ports so local tooling can hit them directly.
-# start.sh auto-picks ASR_PORT / TTS_PORT / MINER_PORT when free or already healthy.
+# ASR/TTS must already be up via stt_install.sh / tts_install.sh
+# (or reachable at MINER_ASR_UPSTREAM / MINER_TTS_UPSTREAM).
 
 services:
-  violet-asr:
-    ports:
-      - "${ASR_PORT:-${MOCK_ASR_PORT:-9000}}:${ASR_PORT:-9000}"
-
-  violet-tts:
-    ports:
-      - "${TTS_PORT:-${MOCK_TTS_PORT:-8080}}:${TTS_PORT:-8080}"
-
   violet-miner:
-    # Serve only — no Bittensor registration / announce.
     command: ["--no-chain"]
     environment:
       MINER_PUBLIC_ENDPOINT: ${MINER_PUBLIC_ENDPOINT:-http://127.0.0.1:${MINER_PORT:-8091}}
-      MINER_ASR_UPSTREAM: ${MINER_ASR_UPSTREAM:-http://violet-asr:${ASR_PORT:-9000}}
-      MINER_TTS_UPSTREAM: ${MINER_TTS_UPSTREAM:-http://violet-tts:${TTS_PORT:-8080}}
+      MINER_ASR_UPSTREAM: ${MINER_ASR_UPSTREAM:-http://host.docker.internal:9090}
+      MINER_TTS_UPSTREAM: ${MINER_TTS_UPSTREAM:-http://host.docker.internal:8002}
       MINER_MAX_CONCURRENT_ASR: ${MINER_MAX_CONCURRENT_ASR:-4}
       MINER_MAX_CONCURRENT_TTS: ${MINER_MAX_CONCURRENT_TTS:-4}
       BT_SIGNING_ENABLED: "false"
