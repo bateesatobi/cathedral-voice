@@ -183,7 +183,7 @@ ${device_yaml}
     ports:
       - "\${ETOIL_HOST_PORT:-9090}:8000"
     volumes:
-      - ./audio:/app/audio
+      - stt-audio:/app/audio
     environment:
       SPEACHES_BASE_URL: http://speaches:8000
       SPEACHES_API_KEY: empty
@@ -205,6 +205,7 @@ networks:
 
 volumes:
   hf-hub-cache:
+  stt-audio:
 EOF
 }
 
@@ -302,7 +303,7 @@ ${depends_list}
     ports:
       - "\${ETOIL_HOST_PORT:-9090}:8000"
     volumes:
-      - ./audio:/app/audio
+      - stt-audio:/app/audio
     environment:
       SPEACHES_BASE_URL: http://speaches-lb:8000
       SPEACHES_API_KEY: empty
@@ -324,6 +325,7 @@ networks:
 
 volumes:
   hf-hub-cache:
+  stt-audio:
 EOF
 }
 
@@ -336,7 +338,6 @@ write_compose_file() {
   local n
   n="$(gpu_device_count "$devices")"
   log "STT GPUs: ${devices} (count=${n}, plan=${GPU_PLAN_MODE})"
-  mkdir -p "${PROJECT_DIR}/audio"
 
   if [[ "${STT_SPEACHES_PER_GPU}" == "1" ]] && (( n > 1 )); then
     log "Mode: one speaches per GPU + nginx least_conn LB (all GPUs busy)"
@@ -348,11 +349,29 @@ write_compose_file() {
   log "Wrote ${COMPOSE_FILE}"
 }
 
+warn_docker_in_docker() {
+  if [[ -f /.dockerenv ]] && [[ -z "${STT_ALLOW_NESTED_DOCKER:-}" ]]; then
+    warn "Shell appears to be inside a container (/.dockerenv)."
+    warn "Run stt_install on the GPU host VM, not inside a dev container."
+    warn "Bind mounts to ./audio fail when the Docker daemon is on the host."
+    warn "This script now uses a named volume (stt-audio) to avoid that."
+    warn "Set STT_ALLOW_NESTED_DOCKER=1 to silence this warning."
+  fi
+}
+
 start_stack() {
   log "Pulling images..."
   docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" pull
   log "Starting STT stack (idempotent up -d)..."
-  docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d --remove-orphans
+  if ! docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d --remove-orphans; then
+    err "docker compose up failed."
+    if [[ -f /.dockerenv ]]; then
+      err "If you are inside a container, run ./violet/miner/stt_install.sh on the bare-metal GPU host instead."
+    fi
+    docker compose -f "${COMPOSE_FILE}" ps || true
+    docker compose -f "${COMPOSE_FILE}" logs --tail=40 || true
+    exit 1
+  fi
   docker compose -f "${COMPOSE_FILE}" ps
 }
 
@@ -368,6 +387,7 @@ main() {
     warn "nvidia-smi not found — speaches needs an NVIDIA GPU + driver."
   fi
   write_env_file
+  warn_docker_in_docker
   write_compose_file
   start_stack
   wait_http "etoil-api" "http://127.0.0.1:${ETOIL_HOST_PORT}/health" "${STT_READY_TRIES}"
