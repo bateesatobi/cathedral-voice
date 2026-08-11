@@ -62,6 +62,39 @@ hint_announce() {
   fi
 }
 
+print_provide_checklist() {
+  local port="${MINER_PORT:-8091}"
+  local ep="${MINER_PUBLIC_ENDPOINT:-http://127.0.0.1:${port}}"
+  echo
+  echo "============================================================"
+  echo " What this miner MUST provide (validators + router)"
+  echo "============================================================"
+  echo " Public endpoint : ${ep}"
+  echo " Open TCP        : ${port}  (only this port is announced)"
+  echo
+  echo " API surface on :${port}"
+  echo "   GET  /health"
+  echo "   GET  /capacity          ← GPU / capacity_units"
+  echo "   GET  /violet/info       ← hotkey, uid, services"
+  echo "   POST /transcribe        ← batch ASR"
+  echo "   WS   /realtime/transcribe"
+  echo "   POST /v1/audio/speech/stream"
+  echo "   GET  /v1/voices         (optional)"
+  echo "   WS   /v1/audio/speech/stream/ws"
+  echo
+  echo " On-chain (required for rewards)"
+  echo "   1. BT_WALLET_NAME / BT_WALLET_HOTKEY = wallet *names* (not secrets)"
+  echo "   2. btcli subnet register  → assigns UID"
+  echo "   3. python scripts/announce_endpoint.py  → publishes ${ep}"
+  echo "   4. start.sh prod --gpu     → hotkey appears in /health"
+  echo
+  echo " Verify"
+  echo "   curl -fsS ${ep}/health"
+  echo "   curl -fsS ${ep}/capacity"
+  echo "   python scripts/run_qualification.py ${ep} --services ${MINER_SERVICES:-asr,tts}"
+  echo "============================================================"
+}
+
 export SKIP_ENDPOINT_PROMPT="${SKIP_ENDPOINT_PROMPT:-0}"
 # bootstrap always runs full start; stop-all available via start.sh stop-all
 log "Starting miner (${MODE}) with full GPU utilization..."
@@ -81,4 +114,5 @@ ASR_PORT="${ASR_PORT:-9090}" TTS_PORT="${TTS_PORT:-8002}" MINER_PORT="${MINER_PO
     exit 1
   }
 
+print_provide_checklist
 log "Bootstrap complete."

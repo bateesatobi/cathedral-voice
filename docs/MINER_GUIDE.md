@@ -17,6 +17,40 @@ Leave `VIOLET_NETUID` blank — the repo picks **39** or **292** from `BT_NETWOR
 
 ---
 
+## What validators and the router consume
+
+You announce **one** public URL (`MINER_PUBLIC_ENDPOINT`, port **8091**).  
+Internal ASR (`:9090`) and TTS (`:8002`) stay private; the sidecar proxies them.
+
+| Method | Path | Required | Used for |
+|--------|------|----------|----------|
+| GET | `/health` | yes | Reachability, services, upstreams, capacity snapshot |
+| GET | `/capacity` | yes | GPU inventory → Capacity (C) score |
+| GET | `/violet/info` | yes | Hotkey, uid, services, warnings |
+| POST | `/transcribe` | yes (if ASR) | Batch ASR probes + product traffic |
+| WS | `/realtime/transcribe` | yes (if ASR) | Streaming ASR probes |
+| POST | `/v1/audio/speech/stream` | yes (if TTS) | TTS probes + product traffic |
+| GET | `/v1/voices` | optional | Voice catalogue |
+| WS | `/v1/audio/speech/stream/ws` | optional | Streaming TTS |
+
+**On-chain (no emissions without these):**
+
+1. Register → chain assigns **UID** to your hotkey  
+2. Announce `MINER_PUBLIC_ENDPOINT` (commitment)  
+3. Keep TCP **8091** reachable from the public internet  
+4. Run with wallet loaded (`start.sh prod`) so `/health` shows your hotkey  
+
+`.env` uses wallet **names** only (`BT_WALLET_NAME` / `BT_WALLET_HOTKEY`) — never coldkey/hotkey secrets.
+
+Capture check:
+
+```bash
+./violet/miner/smoke_contract.sh
+python scripts/run_qualification.py http://127.0.0.1:8091 --services asr,tts
+```
+
+---
+
 ## What you need before you start
 
 | Requirement | Why |
@@ -231,15 +265,24 @@ The sidecar proxies:
 ### 9. Verify locally (before spending TAO on chain)
 
 ```bash
-curl -fsS http://127.0.0.1:9090/health      # ASR (etoil)
-curl -fsS http://127.0.0.1:8002/health      # TTS (Spark)
-curl -fsS http://127.0.0.1:8091/health      # miner sidecar
-curl -fsS http://127.0.0.1:8091/capacity    # GPU claim
+# Full validator-facing contract on :8091 (+ local upstreams)
+./violet/miner/smoke_contract.sh
+
+# Spark often 404s on /health — speech stream is the TTS readiness check
+curl -fsS http://127.0.0.1:9090/health
+curl -sS -o /dev/null -w '%{http_code}\n' -H 'Content-Type: application/json' \
+  -d '{"text":"hi","speaker_id":"eng_female_1","temperature":0.7}' \
+  http://127.0.0.1:8002/v1/audio/speech/stream
+
+curl -fsS http://127.0.0.1:8091/health | python3 -m json.tool | head -40
+curl -fsS http://127.0.0.1:8091/capacity | python3 -m json.tool | head -40
+curl -fsS http://127.0.0.1:8091/violet/info | python3 -m json.tool | head -40
 
 # Qualification suite (ASR + TTS contract checks)
-python scripts/run_qualification.py http://127.0.0.1:8091
+python scripts/run_qualification.py http://127.0.0.1:8091 --services asr,tts
 ```
 
+Expect `capacity_units > 0` (e.g. H100 → 2.4) and qualification **All tests passed**.  
 Fix any failures before registering.
 
 ---
