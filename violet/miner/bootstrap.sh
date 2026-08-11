@@ -3,11 +3,13 @@
 # bootstrap.sh — Fail-closed miner bring-up checklist for cathedral-voice.
 #
 # Runs: GPU plan → STT/TTS (per MINER_SERVICES) → sidecar → contract smoke →
-# optional firewall open → wallet/announce hints.
+# admission checklist (wallet, public port hint, announce dry-run) → optional
+# qualification.
 #
 # Usage (from repo root):
 #   ./violet/miner/bootstrap.sh test
 #   ./violet/miner/bootstrap.sh prod --no-follow
+#   BOOTSTRAP_QUALIFY=1 ./violet/miner/bootstrap.sh prod --gpu
 #
 set -euo pipefail
 
@@ -20,6 +22,9 @@ shift || true
 
 # shellcheck source=gpu_env.sh
 source "${SCRIPT_DIR}/gpu_env.sh"
+# shellcheck source=install_lib.sh
+INSTALL_LOG_PREFIX="bootstrap"
+source "${SCRIPT_DIR}/install_lib.sh"
 
 log()  { echo -e "\033[1;32m[bootstrap]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[bootstrap warn]\033[0m $*"; }
@@ -95,6 +100,91 @@ print_provide_checklist() {
   echo "============================================================"
 }
 
+# Admission gate printed after local smoke — the single remaining manual step
+# is usually router/cloud port-forward (scripts cannot open Keenetic WAN ports).
+admission_checklist() {
+  local port="${MINER_PORT:-8091}"
+  local ep="${MINER_PUBLIC_ENDPOINT:-http://127.0.0.1:${port}}"
+  local name="${BT_WALLET_NAME:-default}"
+  local hotkey="${BT_WALLET_HOTKEY:-default}"
+  local fail=0
+
+  echo
+  echo "============================================================"
+  echo " Admission checklist (go-live)"
+  echo "============================================================"
+
+  echo " [1] Local contract smoke"
+  if curl -fsS --max-time 5 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+    echo "     OK  http://127.0.0.1:${port}/health"
+  else
+    echo "     FAIL local /health"
+    fail=1
+  fi
+
+  echo " [2] Wallet names + keyfile"
+  if check_wallet; then
+    if [[ "${MODE}" == "prod" || "${MODE}" == "production" ]]; then
+      if assert_wallet_keyfile; then
+        echo "     OK  volume keyfile for ${name}/${hotkey}"
+      else
+        echo "     FAIL wallet volume unreadable"
+        fail=1
+      fi
+    else
+      echo "     OK  host wallet ${name}/${hotkey}"
+    fi
+  else
+    if [[ "${MODE}" == "prod" || "${MODE}" == "production" ]]; then
+      fail=1
+    fi
+  fi
+
+  echo " [3] Public TCP ${port} (manual — NAT hairpin often fails from this host)"
+  echo "     Announce URL: ${ep}"
+  echo "     Open WAN:${port} → this VM LAN:${port} on your router/SG"
+  echo "     If :80 shows KeeneticOS / router UI, do NOT put the miner on 80."
+  echo "     Verify from a second network:"
+  echo "       curl -fsS ${ep}/health"
+  echo "       nc -vz <public-ip> ${port}"
+  print_public_reachability_hint "$port" "$ep"
+
+  echo " [4] Announce dry-run (prod)"
+  if [[ "${MODE}" == "prod" || "${MODE}" == "production" ]]; then
+    if [[ -f scripts/announce_endpoint.py ]] && command -v python3 >/dev/null 2>&1; then
+      if python3 scripts/announce_endpoint.py --dry-run 2>&1 | tail -n 20; then
+        echo "     OK  announce dry-run"
+      else
+        warn "announce dry-run failed (register wallet / fix .env first)"
+      fi
+    else
+      warn "scripts/announce_endpoint.py or python3 missing — skip dry-run"
+    fi
+  else
+    echo "     skip (mode=${MODE})"
+  fi
+
+  echo " [5] Qualification (optional: BOOTSTRAP_QUALIFY=1)"
+  if [[ "${BOOTSTRAP_QUALIFY:-0}" == "1" ]]; then
+    if [[ -f scripts/run_qualification.py ]] && command -v python3 >/dev/null 2>&1; then
+      python3 scripts/run_qualification.py "http://127.0.0.1:${port}" \
+        --services "${MINER_SERVICES:-asr,tts}" || fail=1
+    else
+      warn "qualification script/python missing"
+    fi
+  else
+    echo "     skip — run: python scripts/run_qualification.py http://127.0.0.1:${port} --services ${MINER_SERVICES:-asr,tts}"
+  fi
+
+  echo "============================================================"
+  if [[ "$fail" -ne 0 ]]; then
+    err "Admission checklist failed — fix items above before expecting rewards"
+    return 1
+  fi
+  log "Admission checklist passed (public port-forward still operator responsibility)"
+  return 0
+}
+
 export SKIP_ENDPOINT_PROMPT="${SKIP_ENDPOINT_PROMPT:-0}"
 # bootstrap always runs full start; stop-all available via start.sh stop-all
 log "Starting miner (${MODE}) with full GPU utilization..."
@@ -115,4 +205,5 @@ ASR_PORT="${ASR_PORT:-9090}" TTS_PORT="${TTS_PORT:-8002}" MINER_PORT="${MINER_PO
   }
 
 print_provide_checklist
+admission_checklist || exit 1
 log "Bootstrap complete."

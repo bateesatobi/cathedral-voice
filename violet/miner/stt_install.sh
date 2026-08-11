@@ -18,18 +18,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=gpu_env.sh
 source "${SCRIPT_DIR}/gpu_env.sh"
+# shellcheck source=install_lib.sh
+INSTALL_LOG_PREFIX="stt_install"
+source "${SCRIPT_DIR}/install_lib.sh"
 
 PROJECT_DIR="${STT_PROJECT_DIR:-${SCRIPT_DIR}/stt-stack}"
 ENV_FILE="${PROJECT_DIR}/.env"
 COMPOSE_FILE="${PROJECT_DIR}/docker-compose.yml"
 NGINX_CONF="${PROJECT_DIR}/nginx-speaches.conf"
 
-DEFAULT_HF_TOKEN="${HF_TOKEN:-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}"
+DEFAULT_HF_TOKEN="$(default_hf_token)"
 ETOIL_HOST_PORT="${ETOIL_HOST_PORT:-9090}"
 SPEACHES_HOST_PORT_BASE="${SPEACHES_HOST_PORT_BASE:-9000}"
 # One replica per GPU (full card) when count>1; set 0 for single multi-GPU container.
 STT_SPEACHES_PER_GPU="${STT_SPEACHES_PER_GPU:-1}"
 STT_READY_TRIES="${STT_READY_TRIES:-600}"  # ~20 min for first HF pull
+STT_STRICT="${STT_STRICT:-1}"
 GPU_PLAN_MODE="${GPU_PLAN_MODE:-stt}"
 
 log()  { echo -e "\033[1;32m[stt_install]\033[0m $*"; }
@@ -46,57 +50,28 @@ require_sudo() {
 
 wait_http() {
   local name="$1" url="$2" tries="${3:-90}"
-  log "Waiting for ${name} (${url}) up to $((tries * 2))s..."
-  local i
-  for ((i = 1; i <= tries; i++)); do
-    if curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
-      log "${name} is up"
-      return 0
-    fi
-    if [[ "$name" == "etoil-api" ]] && docker ps -a --format '{{.Names}} {{.Status}}' 2>/dev/null \
-      | grep -E '^cathedral-etoil-api ' | grep -qiE 'restarting|exited'; then
-      err "etoil-api container is crash-looping (not a slow model pull)."
-      docker logs cathedral-etoil-api --tail=30 2>/dev/null || true
-      return 1
-    fi
-    if (( i % 15 == 0 )); then
-      log "  still waiting (${i}/${tries}) — model download may be in progress"
-    fi
-    sleep 2
-  done
-  err "${name} did not become ready: ${url}"
-  docker compose -f "${COMPOSE_FILE}" logs --tail=80 || true
-  return 1
-}
-
-make_smoke_wav() {
-  local wav="$1"
-  if ! command -v python3 >/dev/null 2>&1; then
+  local cname=""
+  [[ "$name" == "etoil-api" ]] && cname="cathedral-etoil-api"
+  if ! wait_http_ok "$name" "$url" "$tries" "$cname"; then
+    docker compose -f "${COMPOSE_FILE}" logs --tail=80 || true
     return 1
   fi
-  python3 - "$wav" <<'PY'
-import sys, wave, math, struct
-path = sys.argv[1]
-rate, n = 16000, 16000
-with wave.open(path, "w") as w:
-    w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
-    for i in range(n):
-        v = int(8000 * math.sin(2 * math.pi * 440 * i / rate))
-        w.writeframes(struct.pack("<h", v))
-PY
 }
 
 smoke_etoil() {
   local base="http://127.0.0.1:${ETOIL_HOST_PORT}"
-  log "Contract smoke: GET ${base}/health"
-  curl -fsS --max-time 10 "${base}/health" >/dev/null
+  local ok=1
+  log "Contract smoke (miner-facing): GET ${base}/health + POST /transcribe"
+  if ! curl -fsS --max-time 10 "${base}/health" >/dev/null; then
+    err "GET /health failed"
+    ok=0
+  fi
 
   local tmp wav code
   tmp="$(mktemp -d)"
   wav="${tmp}/tone.wav"
-  make_smoke_wav "$wav" || true
-  if [[ -f "$wav" ]]; then
-    # etoil-api exposes /transcribe (Avoices contract), not OpenAI /v1/audio/transcriptions.
+  if make_smoke_wav "$wav"; then
+    # etoil-api exposes /transcribe (validator/miner contract), not OpenAI paths.
     code="$(curl -sS -o /tmp/stt_smoke_body.json -w '%{http_code}' --max-time 300 \
       -F "file=@${wav};type=audio/wav" \
       -F "language=eng" \
@@ -105,14 +80,24 @@ smoke_etoil() {
     if [[ "$code" == "200" ]]; then
       log "Contract smoke: POST /transcribe → 200"
     else
-      warn "Transcription smoke returned HTTP ${code} (health OK; check speaches warm-up/logs)"
+      warn "Transcription smoke returned HTTP ${code}"
       [[ -f /tmp/stt_smoke_body.json ]] && head -c 400 /tmp/stt_smoke_body.json || true
       echo
+      ok=0
     fi
   else
     warn "Could not synthesize WAV; skipped transcription smoke"
+    ok=0
   fi
   rm -rf "$tmp"
+  if [[ "$ok" -ne 1 ]]; then
+    if [[ "${STT_STRICT}" == "1" ]]; then
+      err "STT_STRICT=1 — install smoke failed"
+      return 1
+    fi
+    return 1
+  fi
+  return 0
 }
 
 install_docker() {
@@ -360,13 +345,7 @@ write_compose_file() {
 }
 
 warn_docker_in_docker() {
-  if [[ -f /.dockerenv ]] && [[ -z "${STT_ALLOW_NESTED_DOCKER:-}" ]]; then
-    warn "Shell appears to be inside a container (/.dockerenv)."
-    warn "Run stt_install on the GPU host VM, not inside a dev container."
-    warn "Bind mounts to ./audio fail when the Docker daemon is on the host."
-    warn "This script now uses a named volume (stt-audio) to avoid that."
-    warn "Set STT_ALLOW_NESTED_DOCKER=1 to silence this warning."
-  fi
+  warn_nested_docker "STT_ALLOW_NESTED_DOCKER"
 }
 
 stt_speaches_replica_count() {
@@ -521,7 +500,13 @@ main() {
     warmup_speaches_model || warn "GPU warm-up incomplete — first request may be slow"
   fi
   wait_http "etoil-api" "http://127.0.0.1:${ETOIL_HOST_PORT}/health" "${STT_READY_TRIES}"
-  smoke_etoil || true
+  if ! smoke_etoil; then
+    if [[ "${STT_STRICT}" == "1" ]]; then
+      err "STT contract smoke failed (set STT_STRICT=0 to continue anyway)"
+      exit 1
+    fi
+    warn "STT smoke failed (STT_STRICT=0 — continuing)"
+  fi
 
   log "Done."
   echo "  ASR API (etoil) : http://127.0.0.1:${ETOIL_HOST_PORT}"

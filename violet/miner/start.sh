@@ -2,18 +2,18 @@
 # Start the cathedral-voice miner (real ASR + TTS + sidecar).
 #
 # Usage:
-#   ./violet/miner/start.sh test|prod [--gpu] [--no-follow]
+#   ./violet/miner/start.sh test|prod [--gpu] [--no-follow] [--check-public]
 #   ./violet/miner/start.sh stop|stop-all|status|logs
 #   ./violet/miner/bootstrap.sh test|prod   # fail-closed checklist wrapper
 #
 # Flow:
-#   1. ensure .env + public endpoint
+#   1. ensure .env + public endpoint (validated; reject paste garbage)
 #   2. plan GPUs from MINER_SERVICES (solo → ALL GPUs; both → full partition)
 #   3. stt_install.sh → etoil-api :9090 (+ speaches + LB when multi-GPU)
 #   4. tts_install.sh → Spark-TTS :8002 (pool = GPU count)
 #   5. auto-tune MINER_MAX_CONCURRENT_* from GPU counts (if unset/0)
 #   6. start miner sidecar → proxies to those upstreams
-#   7. contract smoke (+ optional firewall / announce hints)
+#   7. contract smoke (+ optional firewall / announce / public-reachability hints)
 #
 # Upstream defaults:
 #   MINER_ASR_UPSTREAM=http://host.docker.internal:9090   # etoil-api
@@ -26,11 +26,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
+# shellcheck source=install_lib.sh
+INSTALL_LOG_PREFIX="start"
+source "$ROOT/violet/miner/install_lib.sh"
+
 COMPOSE_BASE=(docker compose -f docker/docker-compose.miner.yml)
 MODE="${1:-test}"
 GPU=0
 FOLLOW=1
 SKIP_ENDPOINT_PROMPT="${SKIP_ENDPOINT_PROMPT:-0}"
+CHECK_PUBLIC="${CHECK_PUBLIC:-0}"
 
 # Service listen ports (overridden by resolve_service_ports).
 ASR_PORT="${ASR_PORT:-}"
@@ -42,14 +47,7 @@ usage() {
 }
 
 need_docker() {
-  command -v docker >/dev/null 2>&1 || {
-    echo "docker is required" >&2
-    exit 1
-  }
-  docker compose version >/dev/null 2>&1 || {
-    echo "docker compose plugin is required" >&2
-    exit 1
-  }
+  require_docker_usable || exit 1
 }
 
 ensure_env() {
@@ -455,36 +453,26 @@ prompt_public_endpoint() {
     fi
   fi
 
-  # Guard against pasting shell commands into the prompt (spaces / pipes / etc.).
-  if [[ "$answer" == *" "* ]] || [[ "$answer" == *$'\n'* ]]; then
-    echo "ERROR: public IP/host looks like pasted shell commands: '$answer'" >&2
+  if ! validate_public_endpoint_input "$answer"; then
     echo "Enter only the IP (e.g. 93.120.231.186) or a URL (http://ip:8091)." >&2
     exit 1
   fi
 
+  # Extra shape check: bare token should look like IPv4 or DNS label(s).
   host_or_url="$answer"
-  case "$host_or_url" in
-    http://*|https://*)
-      # If user pasted a URL without an explicit port, attach miner port
-      # (unless https default 443 / http with existing port).
-      if [[ "$host_or_url" =~ ^https?://[^/:]+$ ]]; then
-        if [[ "$host_or_url" == https://* ]]; then
-          answer="$host_or_url"
-        else
-          answer="${host_or_url}:${port}"
-        fi
-      else
-        answer="$host_or_url"
-      fi
-      ;;
-    *:*)
-      # ip:port or host:port
-      answer="http://${host_or_url}"
-      ;;
-    *)
-      answer="http://${host_or_url}:${port}"
-      ;;
-  esac
+  local bare="$host_or_url"
+  bare="${bare#http://}"
+  bare="${bare#https://}"
+  bare="${bare%%/*}"
+  bare="${bare%%:*}"
+  if [[ ! "$bare" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    && [[ ! "$bare" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+    echo "ERROR: public host looks invalid: '$bare'" >&2
+    echo "Expected IPv4 (a.b.c.d) or DNS name (miner.example.com)." >&2
+    exit 1
+  fi
+
+  answer="$(normalize_public_endpoint "$host_or_url" "$port")"
 
   if [[ "$mode" != "test" && "$mode" != "local" ]] && is_local_endpoint "$answer"; then
     echo "ERROR: prod MINER_PUBLIC_ENDPOINT cannot be localhost" >&2
@@ -493,7 +481,11 @@ prompt_public_endpoint() {
 
   export MINER_PUBLIC_ENDPOINT="$answer"
   upsert_env_var "MINER_PUBLIC_ENDPOINT" "$answer" .env
-  echo "==> saved MINER_PUBLIC_ENDPOINT=$answer → .env"
+  # Re-source so callers see the canonical value (guards against .env write races).
+  # shellcheck disable=SC1091
+  set -a && source .env && set +a
+  export MINER_PUBLIC_ENDPOINT="$answer"
+  echo "==> saved MINER_PUBLIC_ENDPOINT=${MINER_PUBLIC_ENDPOINT} → .env"
   echo "==> ASR :${ASR_PORT}  TTS :${TTS_PORT}  (proxied via miner, not announced)"
   echo
 }
@@ -534,64 +526,15 @@ EOF
   fi
 }
 
-# Copy wallets into the named volume used by prod.
-# Nested Docker cannot bind-mount the shell's ~/.bittensor (daemon is on the
-# host), so we stream a tar into the volume instead of -v "$src":/src.
-seed_wallet_volume() {
-  local src="${BT_WALLET_DIR:-${HOME}/.bittensor}"
-  local vol="violet-bittensor-wallets"
-  local name="${BT_WALLET_NAME:-default}"
-  local hotkey="${BT_WALLET_HOTKEY:-default}"
+# seed_wallet_volume / assert_wallet_keyfile come from install_lib.sh
 
-  if [[ "${BT_WALLET_BIND:-0}" == "1" ]]; then
-    echo "==> BT_WALLET_BIND=1 — using host bind ${src}"
-    return 0
-  fi
-
-  docker volume create "$vol" >/dev/null 2>&1 || true
-
-  if [[ ! -d "$src" ]]; then
-    echo "==> no wallet dir at ${src} — volume ${vol} left empty"
-    echo "    create with: btcli wallet new_coldkey / new_hotkey"
-    return 0
-  fi
-
-  echo "==> seeding wallet volume ${vol} from ${src} (tar pipe; DinD-safe)"
-  # Miner image runs as uid 10001 (user violet). Keyfiles are often mode 600
-  # owned by root after seed — chown or the sidecar gets Permission denied.
-  if ! tar -C "$src" -cf - . \
-    | docker run --rm -i \
-        -v "${vol}:/dst" \
-        alpine:3.20 \
-        sh -c 'mkdir -p /dst && tar -C /dst -xf - && chown -R 10001:10001 /dst && chmod -R u+rwX,go-rwx /dst && ls -la /dst/wallets'
-  then
-    echo "WARN: wallet seed failed — miner may start without a hotkey" >&2
-    return 0
-  fi
-
-  # Sanity-check expected keyfile names from .env
-  if [[ -e "${src}/wallets/${name}/hotkeys/${hotkey}" \
-     || -e "${src}/wallets/${name}/hotkeys/${hotkey}.json" ]]; then
-    echo "==> found hotkey file for ${name}/${hotkey} in source tree"
-  else
-    echo "WARN: ${src}/wallets/${name}/hotkeys/${hotkey} not found"
-    echo "    .env has BT_WALLET_NAME=${name} BT_WALLET_HOTKEY=${hotkey}"
-    echo "    list wallets: btcli wallet list"
-    echo "    or: ls -la ${src}/wallets/*/hotkeys/ 2>/dev/null"
-  fi
-}
-
+# Thin wrapper kept for call sites that expect start.sh logging style.
 wait_http() {
   local name="$1" url="$2" tries="${3:-60}"
   echo "==> waiting for $name ($url)"
-  for ((i = 1; i <= tries; i++)); do
-    if curl -fsS "$url" >/dev/null 2>&1; then
-      echo "    $name is up"
-      return 0
-    fi
-    sleep 2
-  done
-  echo "ERROR: $name did not become ready: $url" >&2
+  if wait_http_ok "$name" "$url" "$tries"; then
+    return 0
+  fi
   "${COMPOSE[@]}" ps || true
   "${COMPOSE[@]}" logs --tail=80 || true
   return 1
@@ -628,29 +571,24 @@ start_stack() {
   fi
   if services_want_tts; then
     # Spark frontend often has no /health — wait until speech stream answers.
-    local i tries=450
-    echo "==> waiting for tts(spark) speech readiness on :${TTS_PORT}"
-    for ((i = 1; i <= tries; i++)); do
-      if tts_ready_ok "${TTS_PORT}"; then
-        echo "    tts(spark) is up"
-        break
-      fi
-      if (( i == tries )); then
-        echo "ERROR: tts(spark) did not become ready on :${TTS_PORT}" >&2
-        exit 1
-      fi
-      if (( i % 30 == 0 )); then
-        echo "    still waiting (${i}/${tries})"
-      fi
-      sleep 2
-    done
+    if ! wait_speech_ready "${TTS_PORT}" 450; then
+      echo "ERROR: tts(spark) did not become ready on :${TTS_PORT}" >&2
+      exit 1
+    fi
   fi
 
   apply_concurrency_defaults 2>/dev/null || true
   open_miner_firewall
 
   if [[ "$mode" == "prod" || "$mode" == "production" ]]; then
-    seed_wallet_volume
+    if ! seed_wallet_volume; then
+      echo "ERROR: wallet seed failed — refusing to start prod crash-loop" >&2
+      exit 1
+    fi
+    if ! assert_wallet_keyfile; then
+      echo "ERROR: wallet keyfile missing/unreadable — fix names or re-seed, then retry" >&2
+      exit 1
+    fi
   fi
 
   echo "==> building miner sidecar ($mode)"
@@ -713,6 +651,9 @@ start_stack() {
     echo " Announce (after btcli register):"
     echo "   python scripts/announce_endpoint.py --dry-run"
     echo "   python scripts/announce_endpoint.py"
+  fi
+  if [[ "${CHECK_PUBLIC}" == "1" ]] || [[ "$mode" == "prod" || "$mode" == "production" ]]; then
+    print_public_reachability_hint "${MINER_PORT}" "${MINER_PUBLIC_ENDPOINT}"
   fi
   echo "============================================================"
   echo
@@ -785,6 +726,7 @@ while [[ $# -gt 0 ]]; do
     --gpu) GPU=1 ;;
     --no-follow) FOLLOW=0 ;;
     --skip-endpoint-prompt) SKIP_ENDPOINT_PROMPT=1 ;;
+    --check-public) CHECK_PUBLIC=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown flag: $1" >&2; usage; exit 2 ;;
   esac

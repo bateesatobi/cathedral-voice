@@ -72,6 +72,21 @@ python scripts/run_qualification.py http://127.0.0.1:8091 --services asr,tts
 | 9090 | ASR / etoil-api (local; proxied by sidecar) |
 | 8002 | TTS / Spark (local; proxied by sidecar) |
 
+### Network / NAT (Keenetic and similar routers)
+
+Validators dial **only** `MINER_PUBLIC_ENDPOINT` (TCP **8091**). Opening SSH (`22`) or HTTP (`80`/`443`) is **not** enough.
+
+- If a browser to `http://YOUR_PUBLIC_IP/` shows a **KeeneticOS** (or other) admin panel, WAN **80** is the router — do **not** put the miner on port 80.
+- Forward **WAN:8091 → VM_LAN_IP:8091** on the router (and allow **8091** in any cloud security group).
+- Checking from the miner host often fails due to **NAT hairpin**; verify from a second network:
+
+```bash
+curl -fsS http://YOUR_PUBLIC_IP:8091/health
+nc -vz YOUR_PUBLIC_IP 8091
+```
+
+Install scripts print this as the remaining manual step after local smoke passes.
+
 ---
 
 ## Miner setup — numbered steps
@@ -202,6 +217,10 @@ MINER_ASR_UPSTREAM=http://host.docker.internal:9090
 MINER_TTS_UPSTREAM=http://host.docker.internal:8002
 # Set after step 9, or let start.sh prompt:
 # MINER_PUBLIC_ENDPOINT=http://YOUR_PUBLIC_IP:8091
+
+# Hugging Face token for model pulls (stt_install / tts_install).
+# Prefer your own token; rotate if a shared default was ever committed.
+# HF_TOKEN=hf_...
 ```
 
 **Mainnet example:** same as above, but:
@@ -258,7 +277,14 @@ The sidecar proxies:
 - ASR → etoil-api (`MINER_ASR_UPSTREAM`, default `:9090`)
 - TTS → Spark (`MINER_TTS_UPSTREAM`, default `:8002`)
 
-**Open TCP 8091** in your cloud security group / firewall so validators can reach you.
+**Open TCP 8091** in your cloud security group / firewall so validators can reach you.  
+On home/office routers (Keenetic, etc.), add an explicit port-forward — see [Network / NAT](#network--nat-keenetic-and-similar-routers) above.
+
+`bootstrap.sh` ends with an **admission checklist** (local smoke, wallet, public-port hint, announce dry-run). Optional qualification:
+
+```bash
+BOOTSTRAP_QUALIFY=1 ./violet/miner/bootstrap.sh prod --gpu --no-follow
+```
 
 ---
 
@@ -398,10 +424,12 @@ Details: [MINER_GPU_BOOTSTRAP_REPORT.md](./MINER_GPU_BOOTSTRAP_REPORT.md)
 
 | Symptom | Check |
 |---------|--------|
-| `/health` OK locally, validators can't reach you | Public IP, port **8091**, `MINER_PUBLIC_ENDPOINT`, announce |
+| `/health` OK locally, validators can't reach you | Public IP, port **8091**, `MINER_PUBLIC_ENDPOINT`, announce; Keenetic must forward **8091** (not just 22/80/443) |
+| Port 80 shows router admin UI | Do not bind miner to 80; forward WAN:8091 → VM:8091 |
 | ASR fails | `docker compose -f violet/miner/stt-stack/docker-compose.yml logs` |
 | `mount ... ./audio ... no such file or directory` | Old compose used a bind mount; pull latest `stt_install.sh` (uses `stt-audio` volume) |
 | etoil `EXTERNAL_API_URL` / crash-loop on start | Set `EXTERNAL_API_URL=http://speaches:8000` in compose (fixed in latest `stt_install.sh`) |
 | TTS fails / OOM on 1 GPU | Both stacks share GPU 0 — see GPU report; consider ASR-only or TTS-only host |
+| TTS crash-loop / corrupt tokenizer | Set `HF_TOKEN` and re-run `tts_install.sh` (seeds via huggingface_hub) |
 | `btcli` / announce errors | `BT_NETWORK`, wallet path, TAO balance, netuid **39** vs **292** |
 | No emissions | Registered? Announced? GPUs in allowed tier? Passing qualification? |

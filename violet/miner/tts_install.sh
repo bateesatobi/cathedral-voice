@@ -18,8 +18,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=gpu_env.sh
 source "${SCRIPT_DIR}/gpu_env.sh"
+# shellcheck source=install_lib.sh
+INSTALL_LOG_PREFIX="tts_install"
+source "${SCRIPT_DIR}/install_lib.sh"
 
-DEFAULT_HF_TOKEN="${HF_TOKEN:-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}"
+DEFAULT_HF_TOKEN="$(default_hf_token)"
 IMAGE_TAG="${TTS_IMAGE:-simonallanachuka/spark-tts-frontend:latest}"
 CONTAINER_NAME="${TTS_CONTAINER_NAME:-cathedral-spark-tts}"
 TTS_HOST_PORT="${TTS_HOST_PORT:-8002}"
@@ -34,6 +37,7 @@ SPARK_TTS_DTYPE="${SPARK_TTS_DTYPE:-}"
 MODELS_VOLUME="${TTS_MODELS_VOLUME:-cathedral-tts-models}"
 MODELS_DIR="${TTS_MODELS_DIR:-}"  # optional host bind; empty → use MODELS_VOLUME
 TTS_READY_TRIES="${TTS_READY_TRIES:-900}"  # ~30 min first pull
+TTS_STRICT="${TTS_STRICT:-1}"
 GPU_PLAN_MODE="${GPU_PLAN_MODE:-tts}"
 SHM_SIZE="${TTS_SHM_SIZE:-4gb}"
 SEED_IMAGE="${TTS_SEED_IMAGE:-python:3.11-slim}"
@@ -51,44 +55,17 @@ wait_http() {
   local name="$1" url="$2" tries="${3:-90}"
   # Optional 4th arg: "any" = any HTTP response counts (Spark has no /health).
   local mode="${4:-ok}"
-  log "Waiting for ${name} (${url}) up to $((tries * 2))s..."
-  local i restart_hits=0 code
-  for ((i = 1; i <= tries; i++)); do
-    if [[ "$mode" == "any" ]]; then
-      code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 "$url" 2>/dev/null || echo "000")"
-      if [[ "$code" != "000" && "$code" != "" ]]; then
-        log "${name} is up (HTTP ${code})"
-        return 0
-      fi
-    elif curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
-      log "${name} is up"
-      return 0
-    fi
-    if sudo docker ps -a --format '{{.Names}} {{.Status}}' 2>/dev/null \
-      | grep -E "^${CONTAINER_NAME} " | grep -qiE 'restarting|exited'; then
-      restart_hits=$((restart_hits + 1))
-      if (( restart_hits >= 3 )); then
-        err "${CONTAINER_NAME} is crash-looping (not a slow model pull)."
-        sudo docker logs --tail=60 "${CONTAINER_NAME}" 2>/dev/null || true
-        return 1
-      fi
-    else
-      restart_hits=0
-    fi
-    if (( i % 20 == 0 )); then
-      log "  still waiting (${i}/${tries}) — model download / load may be in progress"
-      sudo docker logs --tail=15 "${CONTAINER_NAME}" 2>/dev/null || true
-    fi
-    sleep 2
-  done
-  err "${name} did not become ready: ${url}"
-  sudo docker logs --tail=100 "${CONTAINER_NAME}" || true
-  return 1
+  if [[ "$mode" == "any" ]]; then
+    wait_http_any "$name" "$url" "$tries" "${CONTAINER_NAME}"
+  else
+    wait_http_ok "$name" "$url" "$tries" "${CONTAINER_NAME}"
+  fi
 }
 
 smoke_tts() {
   local base="http://127.0.0.1:${TTS_HOST_PORT}"
-  log "Contract smoke: speech stream (this image may 404 on /health)"
+  local ok=1
+  log "Contract smoke (miner-facing): POST /v1/audio/speech/stream (do not require /health)"
 
   local code
   code="$(curl -sS -o /tmp/tts_smoke.pcm -w '%{http_code}' --max-time 180 \
@@ -101,15 +78,25 @@ smoke_tts() {
     log "Contract smoke: POST /v1/audio/speech/stream → 200 (${bytes} bytes)"
   else
     warn "Speech stream smoke → HTTP ${code}"
+    ok=0
   fi
 
   code="$(curl -sS -o /tmp/tts_voices.json -w '%{http_code}' --max-time 30 \
     "${base}/v1/audio/voices" 2>/dev/null || echo "000")"
   if [[ "$code" == "200" ]]; then
-    log "Contract smoke: GET /v1/audio/voices → 200"
+    log "Optional: GET /v1/audio/voices → 200"
   else
-    warn "GET /v1/audio/voices → HTTP ${code} (optional on this image)"
+    log "Optional: GET /v1/audio/voices → HTTP ${code} (OK if this image has no /voices)"
   fi
+
+  if [[ "$ok" -ne 1 ]]; then
+    if [[ "${TTS_STRICT}" == "1" ]]; then
+      err "TTS_STRICT=1 — speech stream smoke failed"
+      return 1
+    fi
+    return 1
+  fi
+  return 0
 }
 
 install_docker() {
@@ -323,10 +310,8 @@ main() {
   log "TTS GPUs: ${devices} (pool=${pool}, mem_util=${mem_util}, dtype=${dtype}, plan=${GPU_PLAN_MODE})"
 
   if [[ -f /.dockerenv ]] && [[ -z "${TTS_ALLOW_NESTED_DOCKER:-}" ]]; then
-    warn "Shell appears to be inside a container (/.dockerenv)."
-    warn "Run tts_install on the GPU host VM when possible."
+    warn_nested_docker "TTS_ALLOW_NESTED_DOCKER"
     warn "Using named volume '${MODELS_VOLUME}' for /app/models (avoids bind-mount DinD failures)."
-    warn "Set TTS_ALLOW_NESTED_DOCKER=1 to silence this warning."
   fi
 
   install_docker
@@ -382,7 +367,7 @@ main() {
     "${IMAGE_TAG}"
 
   # This image often 404s on /health; treat any HTTP response as "process is up",
-  # then smoke via speech stream.
+  # then require speech stream (never curl -f /health as readiness).
   wait_http "spark-tts" "http://127.0.0.1:${TTS_HOST_PORT}/health" "${TTS_READY_TRIES}" "any" \
     || {
       err "TTS failed to become healthy. Diagnostics:"
@@ -393,7 +378,15 @@ main() {
       warn "  GPU_PLAN_MODE=tts SPARK_TTS_DTYPE=f16 ./violet/miner/tts_install.sh"
       exit 1
     }
-  smoke_tts || true
+  wait_speech_ready "${TTS_HOST_PORT}" 90 "${CONTAINER_NAME}" \
+    || warn "speech readiness soft-fail before contract smoke"
+  if ! smoke_tts; then
+    if [[ "${TTS_STRICT}" == "1" ]]; then
+      err "TTS contract smoke failed (set TTS_STRICT=0 to continue anyway)"
+      exit 1
+    fi
+    warn "TTS smoke failed (TTS_STRICT=0 — continuing)"
+  fi
 
   log "Done."
   echo "  TTS API         : http://127.0.0.1:${TTS_HOST_PORT}"
