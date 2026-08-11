@@ -1,5 +1,9 @@
 # GPU visibility for the miner sidecar (nvidia-smi inventory / capacity).
 # ASR/TTS GPUs are assigned by stt_install.sh / tts_install.sh (gpu_env.sh).
+#
+# Wallet mounts belong in docker-compose.miner.prod.yml — keep them out of
+# this overlay so nested Docker (shell in container, daemon on host) does not
+# fail when ~/.bittensor is missing on the Docker host.
 
 services:
   violet-miner:
@@ -14,5 +18,4 @@ services:
               count: all
               capabilities: [gpu]
     volumes:
-      - ${BT_WALLET_DIR:-${HOME}/.bittensor}:/home/violet/.bittensor:ro
       - /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro

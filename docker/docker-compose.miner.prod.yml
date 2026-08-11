@@ -1,6 +1,9 @@
 # Production miner extras: wallet mount for chain announce / signing.
 #
 # Used by: violet/miner/start.sh prod
+#
+# Nested Docker note: the path must exist on the *Docker host* (not only inside
+# a shell container). Override with BT_WALLET_DIR=/path/on/host if needed.
 
 services:
   violet-miner:
