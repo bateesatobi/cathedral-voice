@@ -17,3 +17,4 @@ services:
 volumes:
   violet-bittensor-wallets:
     name: violet-bittensor-wallets
+    external: true

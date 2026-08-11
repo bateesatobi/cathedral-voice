@@ -534,31 +534,49 @@ EOF
   fi
 }
 
-# Copy host/shell wallets into the named volume used by prod (DinD-safe).
+# Copy wallets into the named volume used by prod.
+# Nested Docker cannot bind-mount the shell's ~/.bittensor (daemon is on the
+# host), so we stream a tar into the volume instead of -v "$src":/src.
 seed_wallet_volume() {
   local src="${BT_WALLET_DIR:-${HOME}/.bittensor}"
   local vol="violet-bittensor-wallets"
+  local name="${BT_WALLET_NAME:-default}"
+  local hotkey="${BT_WALLET_HOTKEY:-default}"
+
   if [[ "${BT_WALLET_BIND:-0}" == "1" ]]; then
     echo "==> BT_WALLET_BIND=1 — using host bind ${src}"
     return 0
   fi
-  docker volume create "$vol" >/dev/null
+
+  docker volume create "$vol" >/dev/null 2>&1 || true
+
   if [[ ! -d "$src" ]]; then
     echo "==> no wallet dir at ${src} — volume ${vol} left empty"
     echo "    create with: btcli wallet new_coldkey / new_hotkey"
-    echo "    then re-run start.sh prod to seed the volume"
     return 0
   fi
-  echo "==> seeding wallet volume ${vol} from ${src}"
-  docker run --rm \
-    -v "${src}:/src:ro" \
-    -v "${vol}:/dst" \
-    alpine:3.20 \
-    sh -c 'mkdir -p /dst && cp -a /src/. /dst/ && ls -la /dst' \
-    || {
-      echo "WARN: wallet seed failed — miner may start without a hotkey" >&2
-      return 0
-    }
+
+  echo "==> seeding wallet volume ${vol} from ${src} (tar pipe; DinD-safe)"
+  if ! tar -C "$src" -cf - . \
+    | docker run --rm -i \
+        -v "${vol}:/dst" \
+        alpine:3.20 \
+        sh -c 'mkdir -p /dst && tar -C /dst -xf - && ls -la /dst && ls -la /dst/wallets 2>/dev/null || true'
+  then
+    echo "WARN: wallet seed failed — miner may start without a hotkey" >&2
+    return 0
+  fi
+
+  # Sanity-check expected keyfile names from .env
+  if [[ -e "${src}/wallets/${name}/hotkeys/${hotkey}" \
+     || -e "${src}/wallets/${name}/hotkeys/${hotkey}.json" ]]; then
+    echo "==> found hotkey file for ${name}/${hotkey} in source tree"
+  else
+    echo "WARN: ${src}/wallets/${name}/hotkeys/${hotkey} not found"
+    echo "    .env has BT_WALLET_NAME=${name} BT_WALLET_HOTKEY=${hotkey}"
+    echo "    list wallets: btcli wallet list"
+    echo "    or: ls -la ${src}/wallets/*/hotkeys/ 2>/dev/null"
+  fi
 }
 
 wait_http() {
