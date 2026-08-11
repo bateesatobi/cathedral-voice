@@ -507,6 +507,18 @@ compose_files_for() {
       ;;
     prod|production)
       COMPOSE+=(-f docker/docker-compose.miner.prod.yml)
+      # Optional host bind when the Docker daemon can see the path.
+      if [[ "${BT_WALLET_BIND:-0}" == "1" ]]; then
+        local wdir="${BT_WALLET_DIR:-${HOME}/.bittensor}"
+        mkdir -p "$wdir" 2>/dev/null || true
+        cat > docker/docker-compose.miner.wallet-bind.yml <<EOF
+services:
+  violet-miner:
+    volumes:
+      - ${wdir}:/home/violet/.bittensor:ro
+EOF
+        COMPOSE+=(-f docker/docker-compose.miner.wallet-bind.yml)
+      fi
       ;;
     *)
       echo "unknown mode: $mode" >&2
@@ -520,6 +532,33 @@ compose_files_for() {
     COMPOSE+=(-f docker/docker-compose.miner.gpu.yml)
     GPU=1
   fi
+}
+
+# Copy host/shell wallets into the named volume used by prod (DinD-safe).
+seed_wallet_volume() {
+  local src="${BT_WALLET_DIR:-${HOME}/.bittensor}"
+  local vol="violet-bittensor-wallets"
+  if [[ "${BT_WALLET_BIND:-0}" == "1" ]]; then
+    echo "==> BT_WALLET_BIND=1 — using host bind ${src}"
+    return 0
+  fi
+  docker volume create "$vol" >/dev/null
+  if [[ ! -d "$src" ]]; then
+    echo "==> no wallet dir at ${src} — volume ${vol} left empty"
+    echo "    create with: btcli wallet new_coldkey / new_hotkey"
+    echo "    then re-run start.sh prod to seed the volume"
+    return 0
+  fi
+  echo "==> seeding wallet volume ${vol} from ${src}"
+  docker run --rm \
+    -v "${src}:/src:ro" \
+    -v "${vol}:/dst" \
+    alpine:3.20 \
+    sh -c 'mkdir -p /dst && cp -a /src/. /dst/ && ls -la /dst' \
+    || {
+      echo "WARN: wallet seed failed — miner may start without a hotkey" >&2
+      return 0
+    }
 }
 
 wait_http() {
@@ -589,6 +628,10 @@ start_stack() {
 
   apply_concurrency_defaults 2>/dev/null || true
   open_miner_firewall
+
+  if [[ "$mode" == "prod" || "$mode" == "production" ]]; then
+    seed_wallet_volume
+  fi
 
   echo "==> building miner sidecar ($mode)"
   "${COMPOSE[@]}" build

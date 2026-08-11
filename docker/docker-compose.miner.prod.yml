@@ -1,11 +1,19 @@
-# Production miner extras: wallet mount for chain announce / signing.
+# Production miner extras: wallet for chain announce / signing.
 #
 # Used by: violet/miner/start.sh prod
 #
-# Nested Docker note: the path must exist on the *Docker host* (not only inside
-# a shell container). Override with BT_WALLET_DIR=/path/on/host if needed.
+# Default: named Docker volume (works under nested Docker where the shell's
+# ~/.bittensor is not visible to the host daemon).
+#
+# Bare-metal bind mount (optional):
+#   BT_WALLET_BIND=1 BT_WALLET_DIR=$HOME/.bittensor ./violet/miner/start.sh prod
+# (start.sh writes a small override when BT_WALLET_BIND=1)
 
 services:
   violet-miner:
     volumes:
-      - ${BT_WALLET_DIR:-${HOME}/.bittensor}:/home/violet/.bittensor:ro
+      - violet-bittensor-wallets:/home/violet/.bittensor
+
+volumes:
+  violet-bittensor-wallets:
+    name: violet-bittensor-wallets
