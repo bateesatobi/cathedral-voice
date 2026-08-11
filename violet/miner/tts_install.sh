@@ -25,6 +25,8 @@ CONTAINER_NAME="${TTS_CONTAINER_NAME:-cathedral-spark-tts}"
 TTS_HOST_PORT="${TTS_HOST_PORT:-8002}"
 MODEL_NAME="${MODEL_NAME:-phosai/phosai_tts_v1}"
 TOKENIZER_REPO="${TOKENIZER_REPO:-phosai/phosai_tts_v1}"
+# Base Spark assets the frontend always expects under /app/models/Spark-TTS-0.5B
+SPARK_BASE_REPO="${SPARK_BASE_REPO:-SparkAudio/Spark-TTS-0.5B}"
 SPARK_TTS_DTYPE="${SPARK_TTS_DTYPE:-f32}"
 # Prefer a named Docker volume so nested Docker (shell in container, daemon on
 # host) does not fail with "no such file or directory" on bind mounts.
@@ -33,6 +35,7 @@ MODELS_DIR="${TTS_MODELS_DIR:-}"  # optional host bind; empty → use MODELS_VOL
 TTS_READY_TRIES="${TTS_READY_TRIES:-900}"  # ~30 min first pull
 GPU_PLAN_MODE="${GPU_PLAN_MODE:-tts}"
 SHM_SIZE="${TTS_SHM_SIZE:-4gb}"
+SEED_IMAGE="${TTS_SEED_IMAGE:-python:3.11-slim}"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -46,11 +49,22 @@ err()  { echo -e "${RED}[tts_install error]${NC} $*" >&2; }
 wait_http() {
   local name="$1" url="$2" tries="${3:-90}"
   log "Waiting for ${name} (${url}) up to $((tries * 2))s..."
-  local i
+  local i restart_hits=0
   for ((i = 1; i <= tries; i++)); do
     if curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
       log "${name} is up"
       return 0
+    fi
+    if sudo docker ps -a --format '{{.Names}} {{.Status}}' 2>/dev/null \
+      | grep -E "^${CONTAINER_NAME} " | grep -qiE 'restarting|exited'; then
+      restart_hits=$((restart_hits + 1))
+      if (( restart_hits >= 3 )); then
+        err "${CONTAINER_NAME} is crash-looping (not a slow model pull)."
+        sudo docker logs --tail=60 "${CONTAINER_NAME}" 2>/dev/null || true
+        return 1
+      fi
+    else
+      restart_hits=0
     fi
     if (( i % 20 == 0 )); then
       log "  still waiting (${i}/${tries}) — model download / load may be in progress"
@@ -100,6 +114,107 @@ install_docker() {
   sudo sh /tmp/get-docker.sh
   rm -f /tmp/get-docker.sh
   sudo usermod -aG docker "${USER}" || true
+}
+
+# The spark-tts image downloads tokenizer.json with bare curl (often without
+# auth / LFS handling). That writes HTML/empty files → crash loop. Pre-seed the
+# models volume with huggingface_hub instead.
+seed_tts_models() {
+  local models_mount="$1"
+  local seed_src="${models_mount%%:*}"
+  log "Pre-seeding TTS models into volume (Spark base + ${MODEL_NAME})..."
+  log "  This can take several minutes on first run."
+
+  sudo docker pull "${SEED_IMAGE}" >/dev/null
+
+  sudo docker run --rm \
+    -e HF_TOKEN="${DEFAULT_HF_TOKEN}" \
+    -e HUGGING_FACE_HUB_TOKEN="${DEFAULT_HF_TOKEN}" \
+    -e SPARK_BASE_REPO="${SPARK_BASE_REPO}" \
+    -e MODEL_NAME="${MODEL_NAME}" \
+    -v "${seed_src}:/models" \
+    "${SEED_IMAGE}" \
+    bash -c '
+set -euo pipefail
+pip install -q "huggingface_hub>=0.23"
+python - <<'"'"'PY'"'"'
+import os, shutil
+from pathlib import Path
+from huggingface_hub import snapshot_download, hf_hub_download
+
+token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+base_repo = os.environ["SPARK_BASE_REPO"]
+model_name = os.environ["MODEL_NAME"]
+root = Path("/models")
+spark_dir = root / "Spark-TTS-0.5B"
+spark_dir.mkdir(parents=True, exist_ok=True)
+
+# Drop corrupt leftover tokenizer from failed container curls.
+for bad in (spark_dir / "tokenizer.json", spark_dir / "LLM" / "tokenizer.json"):
+    if bad.exists():
+        try:
+            text = bad.read_text(errors="ignore")[:64].lstrip()
+            if not text.startswith("{"):
+                print(f"removing corrupt {bad}")
+                bad.unlink()
+        except Exception:
+            bad.unlink(missing_ok=True)
+
+print(f"snapshot_download {base_repo} → {spark_dir}")
+snapshot_download(
+    repo_id=base_repo,
+    local_dir=str(spark_dir),
+    token=token,
+    local_dir_use_symlinks=False,
+)
+
+# Frontend expects tokenizer.json at model root (not only under LLM/).
+candidates = [
+    spark_dir / "tokenizer.json",
+    spark_dir / "LLM" / "tokenizer.json",
+]
+src = next((p for p in candidates if p.exists() and p.stat().st_size > 1000), None)
+if src is None:
+    # Fallback: fetch LLM tokenizer explicitly from known layouts.
+    for repo, path in (
+        (base_repo, "LLM/tokenizer.json"),
+        (base_repo, "tokenizer.json"),
+        ("unsloth/Spark-TTS-0.5B", "LLM/tokenizer.json"),
+    ):
+        try:
+            downloaded = hf_hub_download(
+                repo_id=repo, filename=path, token=token, local_dir=str(spark_dir)
+            )
+            src = Path(downloaded)
+            if src.exists() and src.stat().st_size > 1000:
+                break
+        except Exception as exc:
+            print(f"  skip {repo}/{path}: {exc}")
+            src = None
+    if src is None:
+        raise SystemExit("could not obtain a valid tokenizer.json")
+
+dest = spark_dir / "tokenizer.json"
+if src.resolve() != dest.resolve():
+    shutil.copy2(src, dest)
+text = dest.read_text(errors="ignore")[:1]
+if text != "{":
+    raise SystemExit(f"tokenizer.json still invalid at {dest}")
+print(f"OK tokenizer.json ({dest.stat().st_size} bytes)")
+
+# Also pull the serving model weights when different from the Spark base.
+if model_name and model_name not in (base_repo, "Spark-TTS-0.5B", "unsloth/Spark-TTS-0.5B"):
+    out = root / model_name.replace("/", "__")
+    print(f"snapshot_download {model_name} → {out}")
+    snapshot_download(
+        repo_id=model_name,
+        local_dir=str(out),
+        token=token,
+        local_dir_use_symlinks=False,
+    )
+print("seed complete")
+PY
+'
 }
 
 main() {
@@ -152,14 +267,17 @@ main() {
     log "Models named volume: ${MODELS_VOLUME}"
   fi
 
-  log "Pulling ${IMAGE_TAG}..."
-  sudo docker pull "${IMAGE_TAG}"
-
+  # Stop crash-looping container before seeding so the volume is free.
   if sudo docker ps -a --format '{{.Names}}' | grep -Eq "^${CONTAINER_NAME}\$"; then
-    warn "Replacing existing container ${CONTAINER_NAME}"
+    warn "Stopping existing container ${CONTAINER_NAME} before model seed"
     sudo docker stop "${CONTAINER_NAME}" || true
     sudo docker rm "${CONTAINER_NAME}" || true
   fi
+
+  seed_tts_models "${models_mount}"
+
+  log "Pulling ${IMAGE_TAG}..."
+  sudo docker pull "${IMAGE_TAG}"
 
   local cuda_inside
   cuda_inside="$(gpu_index_list "$n")"
@@ -171,6 +289,7 @@ main() {
     --gpus "device=${devices}" \
     -p "${TTS_HOST_PORT}:8002" \
     -e HF_TOKEN="${DEFAULT_HF_TOKEN}" \
+    -e HUGGING_FACE_HUB_TOKEN="${DEFAULT_HF_TOKEN}" \
     -e MODEL_NAME="${MODEL_NAME}" \
     -e TOKENIZER_REPO="${TOKENIZER_REPO}" \
     -e NVIDIA_VISIBLE_DEVICES="${devices}" \
