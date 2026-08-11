@@ -387,6 +387,58 @@ start_stack() {
   docker compose -f "${COMPOSE_FILE}" ps
 }
 
+pull_speaches_model() {
+  local model="${SPEACHES_TRANSCRIPTION_MODEL:-Achuka/etoil-whisper-stt}"
+  local speaches_url="http://127.0.0.1:${SPEACHES_HOST_PORT_BASE}"
+  local timeout_s="${STT_MODEL_PULL_TIMEOUT_S:-1800}"
+  local poll_s=15 elapsed=0
+
+  model_list_has() {
+    curl -fsS --max-time 10 "${speaches_url}/v1/models" 2>/dev/null | grep -q "${model}"
+  }
+
+  log "Ensuring model '${model}' is installed in speaches..."
+
+  if model_list_has; then
+    log "Model '${model}' already installed (skip POST — it blocks until download finishes)"
+    return 0
+  fi
+
+  # POST is synchronous in speaches — can hang 10–30+ min on first HF pull.
+  # Kick off in background and poll /v1/models instead of blocking the install script.
+  log "Starting model download (POST runs in background; may take 10–30 min first time)..."
+  curl -sS -o /tmp/speaches_model_pull.json \
+    -X POST "${speaches_url}/v1/models/${model}" \
+    --max-time "${timeout_s}" &
+  local pull_pid=$!
+
+  while (( elapsed < timeout_s )); do
+    if model_list_has; then
+      log "Model '${model}' is available"
+      wait "$pull_pid" 2>/dev/null || true
+      return 0
+    fi
+    if ! kill -0 "$pull_pid" 2>/dev/null; then
+      break
+    fi
+    if (( elapsed > 0 && elapsed % 60 == 0 )); then
+      log "  still downloading (${elapsed}s / ${timeout_s}s) — watch: docker logs -f cathedral-speaches"
+    fi
+    sleep "$poll_s"
+    elapsed=$((elapsed + poll_s))
+  done
+
+  if model_list_has; then
+    log "Model '${model}' is available"
+    return 0
+  fi
+
+  warn "Model '${model}' not listed after ${timeout_s}s"
+  warn "Check: curl ${speaches_url}/v1/models  and  docker logs cathedral-speaches"
+  kill "$pull_pid" 2>/dev/null || true
+  return 1
+}
+
 main() {
   require_sudo
   plan_gpu_devices "${GPU_PLAN_MODE}"
@@ -402,6 +454,8 @@ main() {
   warn_docker_in_docker
   write_compose_file
   start_stack
+  wait_http "speaches" "http://127.0.0.1:${SPEACHES_HOST_PORT_BASE}/health" 120
+  pull_speaches_model
   wait_http "etoil-api" "http://127.0.0.1:${ETOIL_HOST_PORT}/health" "${STT_READY_TRIES}"
   smoke_etoil || true
 
