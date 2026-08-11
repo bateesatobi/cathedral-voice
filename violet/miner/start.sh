@@ -57,11 +57,38 @@ ensure_env() {
     echo "==> creating .env from .env.example"
     cp .env.example .env
   fi
+  # Load .env defaults, but keep any vars already set on the command line
+  # (e.g. MINER_SERVICES=asr must not be overwritten by MINER_SERVICES=asr,tts).
+  local _preserve=(
+    MINER_SERVICES
+    MINER_PUBLIC_ENDPOINT
+    MINER_ASR_UPSTREAM
+    MINER_TTS_UPSTREAM
+    MINER_PORT
+    ASR_PORT
+    TTS_PORT
+    SKIP_INFERENCE_INSTALL
+    SKIP_ENDPOINT_PROMPT
+    MINER_MAX_CONCURRENT_ASR
+    MINER_MAX_CONCURRENT_TTS
+    STT_GPU_DEVICES
+    TTS_GPU_DEVICES
+    GPU_PLAN_MODE
+  )
+  local _saved=()
+  local key
+  for key in "${_preserve[@]}"; do
+    if [[ -n "${!key+x}" ]]; then
+      _saved+=("$key=${!key}")
+    fi
+  done
   # shellcheck disable=SC1091
   set -a
-  # Prefer repo .env without clobbering explicit exports from the caller.
   [[ -f .env ]] && source .env
   set +a
+  for key in "${_saved[@]}"; do
+    export "${key?}"
+  done
 }
 
 detect_public_ip() {
@@ -405,6 +432,13 @@ prompt_public_endpoint() {
       echo "ERROR: prod needs a publicly reachable IP or DNS" >&2
       exit 1
     fi
+  fi
+
+  # Guard against pasting shell commands into the prompt (spaces / pipes / etc.).
+  if [[ "$answer" == *" "* ]] || [[ "$answer" == *$'\n'* ]]; then
+    echo "ERROR: public IP/host looks like pasted shell commands: '$answer'" >&2
+    echo "Enter only the IP (e.g. 93.120.231.186) or a URL (http://ip:8091)." >&2
+    exit 1
   fi
 
   host_or_url="$answer"

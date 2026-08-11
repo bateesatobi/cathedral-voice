@@ -26,7 +26,10 @@ TTS_HOST_PORT="${TTS_HOST_PORT:-8002}"
 MODEL_NAME="${MODEL_NAME:-phosai/phosai_tts_v1}"
 TOKENIZER_REPO="${TOKENIZER_REPO:-phosai/phosai_tts_v1}"
 SPARK_TTS_DTYPE="${SPARK_TTS_DTYPE:-f32}"
-MODELS_DIR="${TTS_MODELS_DIR:-${SCRIPT_DIR}/tts-models}"
+# Prefer a named Docker volume so nested Docker (shell in container, daemon on
+# host) does not fail with "no such file or directory" on bind mounts.
+MODELS_VOLUME="${TTS_MODELS_VOLUME:-cathedral-tts-models}"
+MODELS_DIR="${TTS_MODELS_DIR:-}"  # optional host bind; empty → use MODELS_VOLUME
 TTS_READY_TRIES="${TTS_READY_TRIES:-900}"  # ~30 min first pull
 GPU_PLAN_MODE="${GPU_PLAN_MODE:-tts}"
 SHM_SIZE="${TTS_SHM_SIZE:-4gb}"
@@ -109,7 +112,11 @@ main() {
     exit 1
   fi
 
-  check_disk_gb 40 "${MODELS_DIR}" || warn "Low disk — TTS model pulls may fail"
+  if [[ -n "${MODELS_DIR}" ]]; then
+    check_disk_gb 40 "${MODELS_DIR}" || warn "Low disk — TTS model pulls may fail"
+  else
+    check_disk_gb 40 / || warn "Low disk — TTS model pulls may fail"
+  fi
 
   local pool="${MODEL_POOL_SIZE:-$n}"
   # Shared single-GPU with STT: leave headroom. Solo / dedicated cards: use more VRAM.
@@ -125,10 +132,26 @@ main() {
 
   log "TTS GPUs: ${devices} (pool=${pool}, mem_util=${mem_util}, plan=${GPU_PLAN_MODE})"
 
+  if [[ -f /.dockerenv ]] && [[ -z "${TTS_ALLOW_NESTED_DOCKER:-}" ]]; then
+    warn "Shell appears to be inside a container (/.dockerenv)."
+    warn "Run tts_install on the GPU host VM when possible."
+    warn "Using named volume '${MODELS_VOLUME}' for /app/models (avoids bind-mount DinD failures)."
+    warn "Set TTS_ALLOW_NESTED_DOCKER=1 to silence this warning."
+  fi
+
   install_docker
   install_nvidia_toolkit_if_needed "sudo"
 
-  mkdir -p "${MODELS_DIR}"
+  local models_mount
+  if [[ -n "${MODELS_DIR}" ]]; then
+    mkdir -p "${MODELS_DIR}"
+    models_mount="${MODELS_DIR}:/app/models"
+    log "Models bind mount: ${MODELS_DIR}"
+  else
+    models_mount="${MODELS_VOLUME}:/app/models"
+    log "Models named volume: ${MODELS_VOLUME}"
+  fi
+
   log "Pulling ${IMAGE_TAG}..."
   sudo docker pull "${IMAGE_TAG}"
 
@@ -156,7 +179,7 @@ main() {
     -e SPARK_TTS_DTYPE="${SPARK_TTS_DTYPE}" \
     -e GPU_MEMORY_UTILIZATION="${mem_util}" \
     -e PORT=8002 \
-    -v "${MODELS_DIR}:/app/models" \
+    -v "${models_mount}" \
     -v cathedral_spark_hf_cache:/root/.cache/huggingface \
     --shm-size="${SHM_SIZE}" \
     "${IMAGE_TAG}"
