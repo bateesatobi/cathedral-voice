@@ -53,6 +53,12 @@ wait_http() {
       log "${name} is up"
       return 0
     fi
+    if [[ "$name" == "etoil-api" ]] && docker ps -a --format '{{.Names}} {{.Status}}' 2>/dev/null \
+      | grep -E '^cathedral-etoil-api ' | grep -qiE 'restarting|exited'; then
+      err "etoil-api container is crash-looping (not a slow model pull)."
+      docker logs cathedral-etoil-api --tail=30 2>/dev/null || true
+      return 1
+    fi
     if (( i % 15 == 0 )); then
       log "  still waiting (${i}/${tries}) — model download may be in progress"
     fi
@@ -140,6 +146,20 @@ EOF
   log "Wrote ${ENV_FILE} (mode 600)"
 }
 
+# etoil-api reads EXTERNAL_API_URL at import time (OpenAI client → speaches /v1).
+# SPEACHES_BASE_URL is used for realtime WebSocket proxy.
+etoil_environment_block() {
+  local upstream="$1"
+  cat <<EOF
+      EXTERNAL_API_URL: ${upstream}
+      SPEACHES_BASE_URL: ${upstream}
+      SPEACHES_API_KEY: empty
+      SPEACHES_TRANSCRIPTION_MODEL: Achuka/etoil-whisper-stt
+      SPEACHES_OPEN_TIMEOUT: "60"
+      PYTHONUNBUFFERED: "1"
+EOF
+}
+
 write_compose_single_speaches() {
   local devices="$1"
   local device_yaml
@@ -185,11 +205,7 @@ ${device_yaml}
     volumes:
       - stt-audio:/app/audio
     environment:
-      SPEACHES_BASE_URL: http://speaches:8000
-      SPEACHES_API_KEY: empty
-      SPEACHES_TRANSCRIPTION_MODEL: Achuka/etoil-whisper-stt
-      SPEACHES_OPEN_TIMEOUT: "60"
-      PYTHONUNBUFFERED: "1"
+$(etoil_environment_block "http://speaches:8000")
     depends_on:
       - speaches
     healthcheck:
@@ -305,11 +321,7 @@ ${depends_list}
     volumes:
       - stt-audio:/app/audio
     environment:
-      SPEACHES_BASE_URL: http://speaches-lb:8000
-      SPEACHES_API_KEY: empty
-      SPEACHES_TRANSCRIPTION_MODEL: Achuka/etoil-whisper-stt
-      SPEACHES_OPEN_TIMEOUT: "60"
-      PYTHONUNBUFFERED: "1"
+$(etoil_environment_block "http://speaches-lb:8000")
     depends_on:
       - speaches-lb
     healthcheck:
