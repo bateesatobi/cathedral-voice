@@ -30,6 +30,7 @@ services:
       MINER_HOST: 0.0.0.0
       MINER_PORT: "${MINER_PORT:-8091}"
       MINER_PUBLIC_ENDPOINT: ${MINER_PUBLIC_ENDPOINT:-http://127.0.0.1:${MINER_PORT:-8091}}
+      MINER_ASR_STREAM_MODE: ${MINER_ASR_STREAM_MODE:-batch_proxy}
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:$${MINER_PORT}/health"]
       interval: 10s

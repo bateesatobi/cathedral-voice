@@ -507,9 +507,6 @@ compose_files_for() {
       ;;
     prod|production)
       COMPOSE+=(-f docker/docker-compose.miner.prod.yml)
-      if [[ "$GPU" -eq 1 ]]; then
-        COMPOSE+=(-f docker/docker-compose.miner.gpu.yml)
-      fi
       ;;
     *)
       echo "unknown mode: $mode" >&2
@@ -517,6 +514,12 @@ compose_files_for() {
       exit 2
       ;;
   esac
+  # Capacity scoring needs nvidia-smi inside the sidecar (test and prod).
+  if [[ "$GPU" -eq 1 ]] \
+    || { [[ "${MINER_AUTO_GPU:-1}" == "1" ]] && command -v nvidia-smi >/dev/null 2>&1; }; then
+    COMPOSE+=(-f docker/docker-compose.miner.gpu.yml)
+    GPU=1
+  fi
 }
 
 wait_http() {

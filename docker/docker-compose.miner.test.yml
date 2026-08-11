@@ -10,6 +10,8 @@ services:
       MINER_PUBLIC_ENDPOINT: ${MINER_PUBLIC_ENDPOINT:-http://127.0.0.1:${MINER_PORT:-8091}}
       MINER_ASR_UPSTREAM: ${MINER_ASR_UPSTREAM:-http://host.docker.internal:9090}
       MINER_TTS_UPSTREAM: ${MINER_TTS_UPSTREAM:-http://host.docker.internal:8002}
+      # etoil is batch-first; synthesize WS partials via /transcribe
+      MINER_ASR_STREAM_MODE: ${MINER_ASR_STREAM_MODE:-batch_proxy}
       MINER_MAX_CONCURRENT_ASR: ${MINER_MAX_CONCURRENT_ASR:-4}
       MINER_MAX_CONCURRENT_TTS: ${MINER_MAX_CONCURRENT_TTS:-4}
       BT_SIGNING_ENABLED: "false"

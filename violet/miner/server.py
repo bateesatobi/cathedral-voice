@@ -307,10 +307,19 @@ def create_app(state: MinerState) -> FastAPI:
             return
         await websocket.accept()
 
-        target = f"{state.config.ws_base('asr')}{PATH_ASR_STREAM_WS}?language={language}"
+        mode = (state.config.asr_stream_mode or "batch_proxy").strip().lower()
         try:
             async with state.asr_slots.acquire():
-                await _bridge_websocket(websocket, target, binary_to_upstream=True)
+                if mode in {"bridge", "upstream", "proxy"}:
+                    target = (
+                        f"{state.config.ws_base('asr')}"
+                        f"{PATH_ASR_STREAM_WS}?language={language}"
+                    )
+                    await _bridge_websocket(websocket, target, binary_to_upstream=True)
+                else:
+                    # Default: etoil/speaches are batch-first; synthesize partials
+                    # by re-transcribing the growing PCM buffer.
+                    await _asr_stream_batch_proxy(websocket, state, language)
         except AtCapacity as exc:
             await websocket.close(code=1013, reason=str(exc))
         except WebSocketDisconnect:
@@ -478,6 +487,100 @@ async def _proxy_stream(
     return StreamingResponse(
         replay(), status_code=status, media_type=media_type, headers=upstream_headers
     )
+
+
+async def _asr_stream_batch_proxy(
+    client_ws: WebSocket, state: MinerState, language: str
+) -> None:
+    """Emit violet-shaped partials by batch-transcribing a growing PCM buffer.
+
+    Used when the upstream ASR container (etoil-api) exposes batch ``/transcribe``
+    but not a compatible ``/realtime/transcribe`` WebSocket.
+    """
+    import io
+    import wave
+
+    pcm = bytearray()
+    last_emit_at = 0
+    # Emit as soon as we have ~0.1 s so first_partial stays under probe budgets.
+    emit_every = 16000 * 2 // 10  # 0.1s → 3200 bytes
+    last_text = ""
+
+    async def transcribe_buffer(*, final: bool) -> None:
+        nonlocal last_text
+        if not pcm and not final:
+            return
+        payload = bytes(pcm) if pcm else b"\x00" * 3200
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(payload)
+        form = aiohttp.FormData()
+        form.add_field(
+            "file",
+            buf.getvalue(),
+            filename="stream.wav",
+            content_type="audio/wav",
+        )
+        form.add_field("language", language)
+        form.add_field("response_format", "json")
+        try:
+            status, body, _headers = await state.asr.post_multipart(
+                PATH_ASR_TRANSCRIBE, form, timeout_s=30.0
+            )
+        except UpstreamError as exc:
+            logger.debug("batch_proxy transcribe failed: %s", exc)
+            if final:
+                await client_ws.send_text(
+                    json.dumps(
+                        {
+                            "type": "final",
+                            "text": last_text,
+                            "is_final": True,
+                            "language": language,
+                        }
+                    )
+                )
+            return
+        text = last_text
+        if status < 400 and body:
+            try:
+                data = json.loads(body.decode("utf-8", errors="ignore"))
+                text = (data.get("text") or data.get("transcript") or "").strip()
+            except json.JSONDecodeError:
+                text = body.decode("utf-8", errors="ignore").strip()
+        if text:
+            last_text = text
+        await client_ws.send_text(
+            json.dumps(
+                {
+                    "type": "final" if final else "partial",
+                    "text": last_text,
+                    "is_final": bool(final),
+                    "language": language,
+                }
+            )
+        )
+
+    try:
+        while True:
+            message = await client_ws.receive()
+            kind = message.get("type")
+            if kind == "websocket.disconnect":
+                break
+            if message.get("bytes") is not None:
+                pcm.extend(message["bytes"])
+                if len(pcm) - last_emit_at >= emit_every:
+                    await transcribe_buffer(final=False)
+                    last_emit_at = len(pcm)
+            elif message.get("text") is not None:
+                text = (message.get("text") or "").strip().lower()
+                if text in {"eos", "end", '{"type":"eos"}'}:
+                    break
+    finally:
+        await transcribe_buffer(final=True)
 
 
 async def _bridge_websocket(

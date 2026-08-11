@@ -144,6 +144,13 @@ class MinerConfig:
     #: WebSocket bases. Derived from the HTTP upstreams when left empty.
     asr_ws_upstream: str = field(default_factory=lambda: _env("MINER_ASR_WS_UPSTREAM"))
     tts_ws_upstream: str = field(default_factory=lambda: _env("MINER_TTS_WS_UPSTREAM"))
+    #: How realtime ASR is served when upstream has no violet-shaped WS:
+    #:   bridge      — proxy WS binary frames to upstream /realtime/transcribe
+    #:   batch_proxy — buffer PCM, periodically POST /transcribe, emit partials
+    #:   auto        — batch_proxy (etoil/speaches are batch-first)
+    asr_stream_mode: str = field(
+        default_factory=lambda: _env("MINER_ASR_STREAM_MODE", "batch_proxy")
+    )
 
     #: Image references the operator declares. Validators compare these against
     #: the published official digests (TDD 9.2 "official image requirement").
