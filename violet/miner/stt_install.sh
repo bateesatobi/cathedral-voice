@@ -69,17 +69,12 @@ wait_http() {
   return 1
 }
 
-smoke_etoil() {
-  local base="http://127.0.0.1:${ETOIL_HOST_PORT}"
-  log "Contract smoke: GET ${base}/health"
-  curl -fsS --max-time 10 "${base}/health" >/dev/null
-
-  # Prefer OpenAI-compatible transcription if exposed; else accept health-only.
-  local tmp wav
-  tmp="$(mktemp -d)"
-  wav="${tmp}/tone.wav"
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$wav" <<'PY' 2>/dev/null || true
+make_smoke_wav() {
+  local wav="$1"
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 1
+  fi
+  python3 - "$wav" <<'PY'
 import sys, wave, math, struct
 path = sys.argv[1]
 rate, n = 16000, 16000
@@ -89,27 +84,30 @@ with wave.open(path, "w") as w:
         v = int(8000 * math.sin(2 * math.pi * 440 * i / rate))
         w.writeframes(struct.pack("<h", v))
 PY
-  fi
+}
+
+smoke_etoil() {
+  local base="http://127.0.0.1:${ETOIL_HOST_PORT}"
+  log "Contract smoke: GET ${base}/health"
+  curl -fsS --max-time 10 "${base}/health" >/dev/null
+
+  local tmp wav code
+  tmp="$(mktemp -d)"
+  wav="${tmp}/tone.wav"
+  make_smoke_wav "$wav" || true
   if [[ -f "$wav" ]]; then
-    local code
-    code="$(curl -sS -o /tmp/stt_smoke_body.json -w '%{http_code}' --max-time 120 \
+    # etoil-api exposes /transcribe (Avoices contract), not OpenAI /v1/audio/transcriptions.
+    code="$(curl -sS -o /tmp/stt_smoke_body.json -w '%{http_code}' --max-time 300 \
       -F "file=@${wav};type=audio/wav" \
-      -F "model=Achuka/etoil-whisper-stt" \
-      "${base}/v1/audio/transcriptions" 2>/dev/null || echo "000")"
+      -F "language=eng" \
+      -F "response_format=json" \
+      "${base}/transcribe" 2>/dev/null || echo "000")"
     if [[ "$code" == "200" ]]; then
-      log "Contract smoke: POST /v1/audio/transcriptions → 200"
+      log "Contract smoke: POST /transcribe → 200"
     else
-      # Alternate Avoices-shaped path used by some etoil builds.
-      code="$(curl -sS -o /tmp/stt_smoke_body.json -w '%{http_code}' --max-time 120 \
-        -F "file=@${wav};type=audio/wav" \
-        "${base}/transcribe" 2>/dev/null || echo "000")"
-      if [[ "$code" == "200" ]]; then
-        log "Contract smoke: POST /transcribe → 200"
-      else
-        warn "Transcription smoke returned HTTP ${code} (health OK; check model/logs if scoring fails)"
-        [[ -f /tmp/stt_smoke_body.json ]] && head -c 400 /tmp/stt_smoke_body.json || true
-        echo
-      fi
+      warn "Transcription smoke returned HTTP ${code} (health OK; check speaches warm-up/logs)"
+      [[ -f /tmp/stt_smoke_body.json ]] && head -c 400 /tmp/stt_smoke_body.json || true
+      echo
     fi
   else
     warn "Could not synthesize WAV; skipped transcription smoke"
@@ -371,10 +369,37 @@ warn_docker_in_docker() {
   fi
 }
 
+stt_speaches_replica_count() {
+  local devices="${STT_GPU_DEVICES:-}"
+  local n
+  n="$(gpu_device_count "$devices")"
+  if [[ "${STT_SPEACHES_PER_GPU}" == "1" ]] && (( n > 1 )); then
+    echo "$n"
+  else
+    echo 1
+  fi
+}
+
 start_stack() {
+  local replicas n
+  replicas="$(stt_speaches_replica_count)"
+  n="$replicas"
+
   log "Pulling images..."
   docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" pull
-  log "Starting STT stack (idempotent up -d)..."
+
+  if (( replicas > 1 )); then
+    # Avoid HuggingFace file-lock fights: bootstrap model on GPU 0 first.
+    log "Multi-GPU: starting speaches-0 only for model prefetch..."
+    docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d --remove-orphans speaches-0
+    wait_http "speaches-0" "http://127.0.0.1:${SPEACHES_HOST_PORT_BASE}/health" 120
+    pull_speaches_model
+    warmup_speaches_model || warn "GPU warm-up incomplete on speaches-0 — remaining replicas may retry"
+    log "Starting full STT stack (all speaches + nginx + etoil)..."
+  else
+    log "Starting STT stack (idempotent up -d)..."
+  fi
+
   if ! docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d --remove-orphans; then
     err "docker compose up failed."
     if [[ -f /.dockerenv ]]; then
@@ -385,6 +410,8 @@ start_stack() {
     exit 1
   fi
   docker compose -f "${COMPOSE_FILE}" ps
+  STT_SPEACHES_REPLICAS="$n"
+  export STT_SPEACHES_REPLICAS
 }
 
 pull_speaches_model() {
@@ -400,13 +427,14 @@ pull_speaches_model() {
   log "Ensuring model '${model}' is installed in speaches..."
 
   if model_list_has; then
-    log "Model '${model}' already installed (skip POST — it blocks until download finishes)"
+    log "Model '${model}' already listed in /v1/models"
     return 0
   fi
 
   # POST is synchronous in speaches — can hang 10–30+ min on first HF pull.
   # Kick off in background and poll /v1/models instead of blocking the install script.
   log "Starting model download (POST runs in background; may take 10–30 min first time)..."
+  log "  HuggingFace filelock lines in docker logs are normal while one worker downloads."
   curl -sS -o /tmp/speaches_model_pull.json \
     -X POST "${speaches_url}/v1/models/${model}" \
     --max-time "${timeout_s}" &
@@ -414,7 +442,7 @@ pull_speaches_model() {
 
   while (( elapsed < timeout_s )); do
     if model_list_has; then
-      log "Model '${model}' is available"
+      log "Model '${model}' is listed in /v1/models"
       wait "$pull_pid" 2>/dev/null || true
       return 0
     fi
@@ -429,13 +457,46 @@ pull_speaches_model() {
   done
 
   if model_list_has; then
-    log "Model '${model}' is available"
+    log "Model '${model}' is listed in /v1/models"
     return 0
   fi
 
   warn "Model '${model}' not listed after ${timeout_s}s"
-  warn "Check: curl ${speaches_url}/v1/models  and  docker logs cathedral-speaches"
+  warn "Check: curl ${speaches_url}/v1/models  and  docker logs -f cathedral-speaches"
   kill "$pull_pid" 2>/dev/null || true
+  return 1
+}
+
+# Listed in /v1/models ≠ weights loaded on GPU. First inference can take minutes.
+warmup_speaches_model() {
+  local model="${SPEACHES_TRANSCRIPTION_MODEL:-Achuka/etoil-whisper-stt}"
+  local speaches_url="http://127.0.0.1:${SPEACHES_HOST_PORT_BASE}"
+  local timeout_s="${STT_WARMUP_TIMEOUT_S:-600}"
+  local tmp wav code
+
+  log "Warming up '${model}' on GPU (first inference loads weights; up to ${timeout_s}s)..."
+  tmp="$(mktemp -d)"
+  wav="${tmp}/tone.wav"
+  if ! make_smoke_wav "$wav"; then
+    warn "Could not synthesize WAV; skipped GPU warm-up"
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  code="$(curl -sS -o /tmp/speaches_warmup.json -w '%{http_code}' --max-time "${timeout_s}" \
+    -F "file=@${wav};type=audio/wav" \
+    -F "model=${model}" \
+    "${speaches_url}/v1/audio/transcriptions" 2>/dev/null || echo "000")"
+  rm -rf "$tmp"
+
+  if [[ "$code" == "200" ]]; then
+    log "GPU warm-up OK (speaches /v1/audio/transcriptions → 200)"
+    return 0
+  fi
+
+  warn "GPU warm-up returned HTTP ${code}"
+  [[ -f /tmp/speaches_warmup.json ]] && head -c 400 /tmp/speaches_warmup.json || true
+  echo
   return 1
 }
 
@@ -454,8 +515,11 @@ main() {
   warn_docker_in_docker
   write_compose_file
   start_stack
-  wait_http "speaches" "http://127.0.0.1:${SPEACHES_HOST_PORT_BASE}/health" 120
-  pull_speaches_model
+  if [[ "${STT_SPEACHES_REPLICAS:-1}" -le 1 ]]; then
+    wait_http "speaches" "http://127.0.0.1:${SPEACHES_HOST_PORT_BASE}/health" 120
+    pull_speaches_model || warn "Model pull incomplete — check docker logs"
+    warmup_speaches_model || warn "GPU warm-up incomplete — first request may be slow"
+  fi
   wait_http "etoil-api" "http://127.0.0.1:${ETOIL_HOST_PORT}/health" "${STT_READY_TRIES}"
   smoke_etoil || true
 
