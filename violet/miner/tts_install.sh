@@ -27,7 +27,8 @@ MODEL_NAME="${MODEL_NAME:-phosai/phosai_tts_v1}"
 TOKENIZER_REPO="${TOKENIZER_REPO:-phosai/phosai_tts_v1}"
 # Base Spark assets the frontend always expects under /app/models/Spark-TTS-0.5B
 SPARK_BASE_REPO="${SPARK_BASE_REPO:-SparkAudio/Spark-TTS-0.5B}"
-SPARK_TTS_DTYPE="${SPARK_TTS_DTYPE:-f32}"
+# Empty → auto: f16 when sharing one GPU with STT, else f32
+SPARK_TTS_DTYPE="${SPARK_TTS_DTYPE:-}"
 # Prefer a named Docker volume so nested Docker (shell in container, daemon on
 # host) does not fail with "no such file or directory" on bind mounts.
 MODELS_VOLUME="${TTS_MODELS_VOLUME:-cathedral-tts-models}"
@@ -165,7 +166,6 @@ snapshot_download(
     repo_id=base_repo,
     local_dir=str(spark_dir),
     token=token,
-    local_dir_use_symlinks=False,
 )
 
 # Frontend expects tokenizer.json at model root (not only under LLM/).
@@ -202,7 +202,28 @@ if text != "{":
     raise SystemExit(f"tokenizer.json still invalid at {dest}")
 print(f"OK tokenizer.json ({dest.stat().st_size} bytes)")
 
-# Also pull the serving model weights when different from the Spark base.
+# Crane/Candle looks for model.safetensors at the Spark-TTS-0.5B ROOT,
+# not under LLM/. Official HF layout keeps weights in LLM/ — promote them.
+llm_dir = spark_dir / "LLM"
+for name in (
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "config.json",
+    "generation_config.json",
+):
+    src_w = llm_dir / name
+    dst_w = spark_dir / name
+    if src_w.is_file() and (not dst_w.exists() or dst_w.stat().st_size < src_w.stat().st_size):
+        shutil.copy2(src_w, dst_w)
+        print(f"promote {src_w.relative_to(spark_dir)} → {dst_w.name}")
+for src_w in llm_dir.glob("model-*.safetensors"):
+    dst_w = spark_dir / src_w.name
+    if not dst_w.exists():
+        shutil.copy2(src_w, dst_w)
+        print(f"promote {src_w.name}")
+
+# Also pull the serving model weights when different from the Spark base,
+# then overlay LLM weights into both LLM/ and model root (what Crane loads).
 if model_name and model_name not in (base_repo, "Spark-TTS-0.5B", "unsloth/Spark-TTS-0.5B"):
     out = root / model_name.replace("/", "__")
     print(f"snapshot_download {model_name} → {out}")
@@ -210,8 +231,45 @@ if model_name and model_name not in (base_repo, "Spark-TTS-0.5B", "unsloth/Spark
         repo_id=model_name,
         local_dir=str(out),
         token=token,
-        local_dir_use_symlinks=False,
     )
+    llm_dst = spark_dir / "LLM"
+    llm_dst.mkdir(parents=True, exist_ok=True)
+    for src_dir in (out / "LLM", out):
+        if not src_dir.is_dir():
+            continue
+        for name in (
+            "model.safetensors",
+            "model.safetensors.index.json",
+            "config.json",
+            "generation_config.json",
+        ):
+            src_f = src_dir / name
+            if src_f.is_file() and src_f.stat().st_size > 100:
+                for dst in (llm_dst / name, spark_dir / name):
+                    shutil.copy2(src_f, dst)
+                    print(f"overlay {src_f} → {dst}")
+        for src_f in src_dir.glob("model-*.safetensors"):
+            for dst in (llm_dst / src_f.name, spark_dir / src_f.name):
+                shutil.copy2(src_f, dst)
+                print(f"overlay {src_f.name}")
+
+# Crane requires model.safetensors or index at the model root.
+root_weight = spark_dir / "model.safetensors"
+root_index = spark_dir / "model.safetensors.index.json"
+if not root_weight.exists() and not root_index.exists():
+    raise SystemExit(
+        f"no model.safetensors at {spark_dir} (Crane needs it at ROOT, not only under LLM/)"
+    )
+
+# Reject git-lfs pointer stubs (tiny files that look downloaded but are not).
+for weight in list(spark_dir.glob("model*.safetensors")) + list(llm_dir.glob("model*.safetensors")):
+    size = weight.stat().st_size
+    head = weight.read_bytes()[:80]
+    if size < 1_000_000 or head.startswith(b"version https://git-lfs.github.com"):
+        raise SystemExit(
+            f"corrupt/incomplete weight {weight} ({size} bytes) — re-seed with network"
+        )
+    print(f"OK weight {weight.relative_to(spark_dir)} ({size} bytes)")
 print("seed complete")
 PY
 '
@@ -237,7 +295,7 @@ main() {
   # Shared single-GPU with STT: leave headroom. Solo / dedicated cards: use more VRAM.
   local mem_util="${GPU_MEMORY_UTILIZATION:-}"
   if [[ -z "$mem_util" ]]; then
-    if [[ "$GPU_PLAN_MODE" == "both" && "$n" -eq 1 && "$GPU_COUNT" -eq 1 ]]; then
+    if [[ "$GPU_PLAN_MODE" == "both" && "$n" -eq 1 && "${GPU_COUNT:-1}" -eq 1 ]]; then
       mem_util="0.35"
       warn "Single-GPU host sharing STT+TTS — GPU_MEMORY_UTILIZATION=${mem_util}"
     else
@@ -245,7 +303,17 @@ main() {
     fi
   fi
 
-  log "TTS GPUs: ${devices} (pool=${pool}, mem_util=${mem_util}, plan=${GPU_PLAN_MODE})"
+  local dtype="${SPARK_TTS_DTYPE}"
+  if [[ -z "$dtype" ]]; then
+    if [[ "$GPU_PLAN_MODE" == "both" && "$n" -eq 1 && "${GPU_COUNT:-1}" -eq 1 ]]; then
+      dtype="f16"
+      warn "Single-GPU host sharing STT+TTS — SPARK_TTS_DTYPE=${dtype}"
+    else
+      dtype="f32"
+    fi
+  fi
+
+  log "TTS GPUs: ${devices} (pool=${pool}, mem_util=${mem_util}, dtype=${dtype}, plan=${GPU_PLAN_MODE})"
 
   if [[ -f /.dockerenv ]] && [[ -z "${TTS_ALLOW_NESTED_DOCKER:-}" ]]; then
     warn "Shell appears to be inside a container (/.dockerenv)."
@@ -280,9 +348,13 @@ main() {
   sudo docker pull "${IMAGE_TAG}"
 
   local cuda_inside
+  # Inside the container Docker already remaps --gpus device=… to ordinals
+  # 0..N-1. Force those remapped indices (not host physical IDs).
   cuda_inside="$(gpu_index_list "$n")"
 
   log "Starting ${CONTAINER_NAME} on host port ${TTS_HOST_PORT}..."
+  # Do not also set NVIDIA_VISIBLE_DEVICES to host IDs — that can make Candle
+  # pick a non-existent CudaDevice ordinal when combined with --gpus device=.
   sudo docker run -d \
     --name "${CONTAINER_NAME}" \
     --restart unless-stopped \
@@ -292,10 +364,9 @@ main() {
     -e HUGGING_FACE_HUB_TOKEN="${DEFAULT_HF_TOKEN}" \
     -e MODEL_NAME="${MODEL_NAME}" \
     -e TOKENIZER_REPO="${TOKENIZER_REPO}" \
-    -e NVIDIA_VISIBLE_DEVICES="${devices}" \
     -e CUDA_VISIBLE_DEVICES="${cuda_inside}" \
     -e MODEL_POOL_SIZE="${pool}" \
-    -e SPARK_TTS_DTYPE="${SPARK_TTS_DTYPE}" \
+    -e SPARK_TTS_DTYPE="${dtype}" \
     -e GPU_MEMORY_UTILIZATION="${mem_util}" \
     -e PORT=8002 \
     -v "${models_mount}" \
@@ -303,7 +374,16 @@ main() {
     --shm-size="${SHM_SIZE}" \
     "${IMAGE_TAG}"
 
-  wait_http "spark-tts" "http://127.0.0.1:${TTS_HOST_PORT}/health" "${TTS_READY_TRIES}"
+  wait_http "spark-tts" "http://127.0.0.1:${TTS_HOST_PORT}/health" "${TTS_READY_TRIES}" \
+    || {
+      err "TTS failed to become healthy. Diagnostics:"
+      sudo docker logs --tail=80 "${CONTAINER_NAME}" 2>/dev/null || true
+      command -v nvidia-smi >/dev/null && nvidia-smi || true
+      warn "If CUDA OOM: stop speaches temporarily, start TTS alone, or set SPARK_TTS_DTYPE=f16"
+      warn "  docker stop cathedral-speaches cathedral-etoil-api"
+      warn "  GPU_PLAN_MODE=tts SPARK_TTS_DTYPE=f16 ./violet/miner/tts_install.sh"
+      exit 1
+    }
   smoke_tts || true
 
   log "Done."
