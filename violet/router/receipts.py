@@ -13,15 +13,27 @@ leak Avoices usage patterns to anyone running a validator.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import sqlite3
 import time
-import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 logger = logging.getLogger("violet.router.receipts")
+
+
+def _deterministic_report_id(since: float, until: float, entries) -> str:
+    """Stable ID for a reporting window so duplicate fetches dedupe correctly."""
+    digest = hashlib.sha256()
+    digest.update(f"{int(since)}-{int(until)}".encode())
+    for entry in sorted(entries, key=lambda e: (e.hotkey, e.service)):
+        digest.update(
+            f"{entry.hotkey}:{entry.service}:{entry.requests}:{entry.seconds:.3f}".encode()
+        )
+    return digest.hexdigest()[:32]
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS receipts (
@@ -116,6 +128,7 @@ class ReceiptLedger:
             self._conn.commit()
         except sqlite3.Error as exc:
             logger.error("could not flush %d receipts: %s", len(batch), exc)
+            self._pending = batch + self._pending
             return 0
         return len(batch)
 
@@ -179,9 +192,7 @@ class ReceiptLedger:
         ]
 
         report = WorkReport(
-            # Deterministic in the period so a validator that fetches twice for
-            # the same window ingests once - the store's unique index keys on it.
-            report_id=f"{int(since)}-{int(until)}-{uuid.uuid4().hex[:8]}",
+            report_id=_deterministic_report_id(since, until, entries),
             generated_at=until,
             period_start=since,
             entries=entries,

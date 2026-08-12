@@ -22,6 +22,7 @@ from ..constants import (
     SERVICE_TTS,
 )
 from ..evalset import EvalSet
+from ..releases import load_release_manifest
 from .discovery import Discovery, MinerRecord, refresh_services_from_health
 from .probes import MinerProbe, ProbeResult
 from .qualification import (
@@ -60,12 +61,16 @@ class Evaluator:
         concurrency: int = 8,
         access_token: str = "",
         availability_window_s: float = QUALIFY_AVAILABILITY_WINDOW_S,
+        require_identity: bool = True,
+        release_manifest_path: str = "",
     ):
         self.store = store
         self.evalset = evalset
         self.concurrency = max(1, concurrency)
         self.access_token = access_token
         self.availability_window_s = availability_window_s
+        self.require_identity = require_identity
+        self.release_manifest = load_release_manifest(release_manifest_path or None)
 
     async def health_sweep(
         self, session: aiohttp.ClientSession, discovery: Discovery
@@ -186,6 +191,8 @@ class Evaluator:
             availability=availability,
             availability_window_s=self.availability_window_s,
             seed=seed,
+            require_identity=self.require_identity,
+            release_manifest=self.release_manifest,
         )
         evaluation.qualification = qualification
         evaluation.qualified = qualification.passed

@@ -30,16 +30,25 @@ from ..protocol import (
     DEFAULT_SAMPLE_RATE,
     DEFAULT_SAMPLE_WIDTH,
     HEADER_CHANNELS,
+    HEADER_MINER_HOTKEY,
     HEADER_SAMPLE_RATE,
     HEADER_SAMPLE_WIDTH,
     PATH_ASR_STREAM_WS,
     PATH_ASR_TRANSCRIBE,
     PATH_CAPACITY,
     PATH_HEALTH,
+    PATH_IDENTITY_CHALLENGE,
+    PATH_INFO,
     PATH_TTS_STREAM,
     PATH_TTS_STREAM_WS,
     CapacityReport,
     HealthReport,
+)
+from ..identity import (
+    challenge_is_fresh,
+    challenge_message,
+    new_nonce,
+    verify_hotkey_signature,
 )
 from .metrics import asr_quality, tts_quality, word_error_rate
 
@@ -123,6 +132,14 @@ class MinerProbe:
                         "health", "JSON is missing the required 'status' field", elapsed
                     )
 
+                header_hotkey = response.headers.get(HEADER_MINER_HOTKEY)
+                if self.hotkey and header_hotkey and header_hotkey != self.hotkey:
+                    return ProbeResult.failure(
+                        "health",
+                        f"hotkey header mismatch (got {header_hotkey[:12]}…)",
+                        elapsed,
+                    )
+
                 report = HealthReport.from_dict(payload)
                 # "degraded" is a real state, not a failure: one of two services
                 # is down and the other should keep serving.
@@ -153,6 +170,88 @@ class MinerProbe:
                 return CapacityReport.from_dict(await response.json())
         except (asyncio.TimeoutError, aiohttp.ClientError, json.JSONDecodeError):
             return None
+
+    async def info(self, timeout_s: float = 5.0) -> Optional[Dict[str, object]]:
+        """Fetch ``/violet/info`` for declared image digests."""
+        try:
+            async with self.session.get(
+                self.url(PATH_INFO), timeout=aiohttp.ClientTimeout(total=timeout_s)
+            ) as response:
+                if response.status != 200:
+                    return None
+                payload = await response.json()
+                return payload if isinstance(payload, dict) else None
+        except (asyncio.TimeoutError, aiohttp.ClientError, json.JSONDecodeError):
+            return None
+
+    async def verify_identity(self, *, timeout_s: float = 5.0) -> ProbeResult:
+        """Confirm the endpoint is bound to the expected on-chain hotkey."""
+        if not self.hotkey:
+            return ProbeResult(
+                ok=True,
+                kind="identity",
+                detail="no expected hotkey configured",
+                payload={"skipped": True},
+            )
+
+        nonce = new_nonce()
+        started = time.perf_counter()
+        try:
+            async with self.session.get(
+                self.url(PATH_IDENTITY_CHALLENGE),
+                params={"nonce": nonce},
+                timeout=aiohttp.ClientTimeout(total=timeout_s),
+            ) as response:
+                elapsed = (time.perf_counter() - started) * 1000.0
+                if response.status == 503:
+                    return ProbeResult(
+                        ok=True,
+                        kind="identity",
+                        detail="identity signing unavailable on miner",
+                        latency_ms=elapsed,
+                        payload={"skipped": True},
+                    )
+                if response.status != 200:
+                    body = await response.text()
+                    return ProbeResult.failure(
+                        "identity",
+                        f"HTTP {response.status}: {body[:120]!r}",
+                        elapsed,
+                    )
+                payload = await response.json()
+        except asyncio.TimeoutError:
+            return ProbeResult.failure(
+                "identity", f"timed out after {timeout_s:.1f}s", timeout_s * 1000.0
+            )
+        except aiohttp.ClientError as exc:
+            return ProbeResult.failure("identity", f"request failed: {exc}")
+
+        elapsed = (time.perf_counter() - started) * 1000.0
+        hotkey = str(payload.get("hotkey", "") or "")
+        signature = str(payload.get("signature", "") or "")
+        issued_at = float(payload.get("issued_at", 0.0) or 0.0)
+        if hotkey != self.hotkey:
+            return ProbeResult.failure(
+                "identity",
+                f"response hotkey {hotkey[:12]}… does not match expected",
+                elapsed,
+            )
+        if str(payload.get("nonce", "")) != nonce:
+            return ProbeResult.failure("identity", "nonce mismatch in response", elapsed)
+        if not challenge_is_fresh(issued_at):
+            return ProbeResult.failure("identity", "challenge response expired", elapsed)
+
+        message = challenge_message(hotkey, nonce, issued_at)
+        if not verify_hotkey_signature(hotkey, message, signature):
+            return ProbeResult.failure(
+                "identity", "signature verification failed", elapsed
+            )
+        return ProbeResult(
+            ok=True,
+            kind="identity",
+            latency_ms=elapsed,
+            detail="hotkey signature verified",
+        )
 
     # -- ASR ---------------------------------------------------------------
 
@@ -229,7 +328,9 @@ class MinerProbe:
         first_partial_ms: Optional[float] = None
 
         try:
-            async with websockets.connect(url, max_size=None, open_timeout=10) as ws:
+            async with websockets.connect(
+                url, max_size=4 * 1024 * 1024, open_timeout=10
+            ) as ws:
                 async def send_audio() -> None:
                     for chunk in chunks:
                         await ws.send(chunk)
@@ -282,6 +383,18 @@ class MinerProbe:
         # streaming, and TDD 8 makes streaming the preferred interaction model.
         progressive = len(partials) > 1 and len(partials[-1]) > len(partials[0])
         quality = asr_quality(item.reference, partials[-1])
+
+        if not progressive or len(partials) < 2:
+            return ProbeResult(
+                ok=False,
+                kind="asr_stream",
+                latency_ms=elapsed,
+                first_byte_ms=first_partial_ms,
+                quality=quality,
+                wer=word_error_rate(item.reference, partials[-1]),
+                detail=f"non-progressive stream ({len(partials)} partials)",
+                payload={"partials": len(partials), "progressive": progressive},
+            )
 
         return ProbeResult(
             ok=True,
@@ -367,9 +480,12 @@ class MinerProbe:
         started = time.perf_counter()
         first_frame_ms: Optional[float] = None
         audio = bytearray()
+        frame_count = 0
 
         try:
-            async with websockets.connect(url, max_size=None, open_timeout=10) as ws:
+            async with websockets.connect(
+                url, max_size=4 * 1024 * 1024, open_timeout=10
+            ) as ws:
                 await ws.send(
                     json.dumps(
                         {"text": item.text, "speaker_id": item.speaker_id, "temperature": 0.7}
@@ -384,6 +500,7 @@ class MinerProbe:
                     if isinstance(message, (bytes, bytearray)):
                         if first_frame_ms is None:
                             first_frame_ms = (time.perf_counter() - started) * 1000.0
+                        frame_count += 1
                         audio.extend(message)
                         continue
                     try:
@@ -413,6 +530,17 @@ class MinerProbe:
             )
 
         quality, note = tts_quality(bytes(audio), item.text)
+        progressive = frame_count >= 2
+        if not progressive:
+            return ProbeResult(
+                ok=False,
+                kind="tts_stream",
+                latency_ms=elapsed,
+                first_byte_ms=first_frame_ms,
+                quality=quality,
+                detail=f"single-frame stream ({frame_count} frames)",
+                payload={"bytes": len(audio), "frames": frame_count, "progressive": False},
+            )
         return ProbeResult(
             ok=quality > 0.0,
             kind="tts_stream",
@@ -420,7 +548,7 @@ class MinerProbe:
             first_byte_ms=first_frame_ms,
             quality=quality,
             detail=note,
-            payload={"bytes": len(audio)},
+            payload={"bytes": len(audio), "frames": frame_count, "progressive": True},
         )
 
     # -- capacity cross-check ---------------------------------------------

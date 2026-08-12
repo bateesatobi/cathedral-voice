@@ -331,5 +331,13 @@ def tts_quality(
         score *= 0.6
         notes.append(f"very low level (rms={stats.rms:.3f})")
 
+    crest = stats.peak / max(stats.rms, 1e-6)
+    if crest < 1.45:
+        score *= 0.25
+        notes.append(f"flat tone (crest={crest:.1f})")
+    elif crest < 2.0:
+        score *= 0.85
+        notes.append(f"limited dynamics (crest={crest:.1f})")
+
     score = max(0.0, min(1.0, score))
     return score, "; ".join(notes) if notes else "ok"

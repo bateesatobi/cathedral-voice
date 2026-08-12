@@ -50,6 +50,7 @@ include = ["violet*"]
 
 [tool.setuptools.package-data]
 "violet.evalset" = ["*.json", "audio/*"]
+"violet.releases" = ["*.json"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

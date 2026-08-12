@@ -25,7 +25,12 @@ def make_pcm(seconds: float, *, rate: int = 24000, amplitude: float = 0.5, silen
     if silent:
         return b"\x00\x00" * frames
     samples = [
-        int(math.sin(2 * math.pi * 220 * i / rate) * amplitude * 32767)
+        int(
+            math.sin(2 * math.pi * 220 * i / rate)
+            * amplitude
+            * (0.35 + 0.65 * abs(math.sin(2 * math.pi * 5 * i / rate)))
+            * 32767
+        )
         for i in range(frames)
     ]
     return struct.pack(f"<{len(samples)}h", *samples)

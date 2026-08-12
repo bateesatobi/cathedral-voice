@@ -7,8 +7,16 @@ does not.
 
 | Control | Implementation | Where |
 |---|---|---|
-| Hardware claims cross-checked | Reported VRAM vs. claimed tier; claimed capacity vs. observed concurrency | `validator/qualification.py` |
-| Serving integrity | Declared image digests published on chain and compared against the official set | `chain/commitment.py` |
+| WebSocket auth | Same bearer token as HTTP (`Authorization` header or `?token=`) | `miner/server.py` |
+| Upload / WS limits | `MINER_MAX_*` env vars; idle timeout on streams | `miner/server.py`, `config.py` |
+| Upstream isolation | ASR/TTS bound to `127.0.0.1` in install scripts | `miner/stt_install.sh`, `miner/tts_install.sh` |
+| HTTPS in prod | `start.sh` rejects `http://` unless `MINER_ALLOW_HTTP=1` | `miner/start.sh` |
+| Endpoint ↔ hotkey binding | Signed `/violet/identity/challenge` | `identity.py`, `validator/probes.py` |
+| Official images | `violet/releases/manifest.json` checked at qualification | `validator/qualification.py` |
+| Work report integrity | HMAC includes `mean_latency_ms`; deterministic `report_id` | `validator/work.py`, `router/receipts.py` |
+| Qualification freshness | Stale qual (>24h) does not earn emissions | `validator/run.py` |
+| Progressive streaming | ASR/TTS streams must emit ≥2 growing chunks | `validator/probes.py`, `qualification.py` |
+| Router hotkey binding | `/health` `x-violet-hotkey` must match metagraph | `router/registry.py` |
 | Endpoint stability | Health probes every 60 s; decay then removal from routing | `validator/evaluator.py`, `router/registry.py` |
 | Evaluation integrity | Probes indistinguishable from production traffic; block-seeded rotating corpus; 7-day window | `validator/probes.py`, `evalset/` |
 | Access control | Router routes only to qualified, currently-healthy miners | `router/registry.py` |

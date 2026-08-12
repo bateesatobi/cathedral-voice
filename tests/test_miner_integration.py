@@ -231,7 +231,11 @@ class TestValidatorAgainstMiner:
         from violet.validator.qualification import AvailabilitySample, run_qualification
 
         evalset = load_evalset()
-        probe = MinerProbe(session, miner.url, hotkey="5Test")
+        probe = MinerProbe(
+            session,
+            miner.url,
+            hotkey="5TestHotkeyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        )
 
         now = time.time()
         availability = [
@@ -244,7 +248,7 @@ class TestValidatorAgainstMiner:
         )
 
         assert result.passed, result.summary()
-        assert len(result.outcomes) == 6
+        assert len(result.outcomes) == 8
 
     async def test_availability_fails_without_observation(self, session, miner):
         """A brand-new miner must not be admitted before it has been watched."""
@@ -271,5 +275,5 @@ class TestValidatorAgainstMiner:
             services=["asr", "tts"], availability=[], availability_window_s=60, seed=1,
         )
         assert not result.passed
-        assert len(result.outcomes) == 6
+        assert len(result.outcomes) == 8
         assert all("unreachable" in o.detail for o in result.outcomes[1:])

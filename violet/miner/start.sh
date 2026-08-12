@@ -481,6 +481,18 @@ prompt_public_endpoint() {
 
   export MINER_PUBLIC_ENDPOINT="$answer"
   upsert_env_var "MINER_PUBLIC_ENDPOINT" "$answer" .env
+
+  if [[ "$mode" == "prod" || "$mode" == "production" ]]; then
+    if [[ "$answer" != https://* ]]; then
+      if [[ "${MINER_ALLOW_HTTP:-0}" == "1" ]]; then
+        echo "WARNING: prod endpoint uses plaintext HTTP (MINER_ALLOW_HTTP=1)" >&2
+      else
+        echo "ERROR: prod MINER_PUBLIC_ENDPOINT must use https:// (set MINER_ALLOW_HTTP=1 for lab only)" >&2
+        exit 1
+      fi
+    fi
+  fi
+
   # Re-source so callers see the canonical value (guards against .env write races).
   # shellcheck disable=SC1091
   set -a && source .env && set +a

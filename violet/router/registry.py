@@ -20,7 +20,7 @@ import aiohttp
 from ..chain import ChainClient
 from ..config import RouterConfig
 from ..constants import GPU_TIERS_BY_KEY, SERVICE_ASR, SERVICE_TTS, SERVICES
-from ..protocol import PATH_HEALTH, GpuInfo, HealthReport
+from ..protocol import PATH_HEALTH, GpuInfo, HealthReport, HEADER_MINER_HOTKEY
 
 logger = logging.getLogger("violet.router.registry")
 
@@ -97,6 +97,8 @@ class MinerEndpoint:
     hotkey: str
     uid: Optional[int]
     endpoint: str
+    coldkey: str = ""
+    access_token: str = ""
     services: List[str] = field(default_factory=list)
     incentive: float = 0.0
     capacity_units: float = 0.0
@@ -197,6 +199,13 @@ class MinerRegistry:
     def get(self, hotkey: str) -> Optional[MinerEndpoint]:
         return self._miners.get(hotkey)
 
+    def apply_access_tokens(self, tokens: Dict[str, str]) -> None:
+        """Attach per-hotkey bearer tokens issued by the Avoices backend."""
+        for hotkey, token in tokens.items():
+            miner = self._miners.get(hotkey)
+            if miner is not None and token:
+                miner.access_token = token
+
     # -- discovery ---------------------------------------------------------
 
     async def discover(self) -> int:
@@ -240,6 +249,7 @@ class MinerRegistry:
                 services=announcement.services or list(SERVICES),
             )
             miner.uid = int(neuron.uid)
+            miner.coldkey = str(getattr(neuron, "coldkey", "") or "")
             miner.endpoint = announcement.endpoint
             miner.services = announcement.services or miner.services or list(SERVICES)
             miner.incentive = float(getattr(neuron, "incentive", 0.0) or 0.0)
@@ -304,6 +314,15 @@ class MinerRegistry:
                     timeout=aiohttp.ClientTimeout(total=self.config.health_timeout_s),
                 ) as response:
                     payload = await response.json()
+                    header_hotkey = response.headers.get(HEADER_MINER_HOTKEY)
+                    if header_hotkey and header_hotkey != miner.hotkey:
+                        logger.warning(
+                            "miner %s hotkey header mismatch (%s)",
+                            miner.hotkey[:10],
+                            header_hotkey[:10],
+                        )
+                        self._apply_health(miner, False, None)
+                        return
                 report = HealthReport.from_dict(payload)
                 # "degraded" still routes: the working half of a two-service
                 # miner is better than no miner.

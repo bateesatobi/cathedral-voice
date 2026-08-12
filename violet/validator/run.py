@@ -36,7 +36,7 @@ from ..logging_utils import setup_logging
 from .antigaming import apply_endpoint_collision_penalty, apply_multi_uid_policy
 from .dashboard import DashboardState, create_dashboard
 from .discovery import Discovery, discover
-from .evaluator import Evaluator, MinerEvaluation
+from .evaluator import Evaluator, MinerEvaluation, qualification_is_fresh
 from .scoring import compute_components, describe_weights, score_miners, suggest_phase
 from .store import ValidatorStore
 from .work import WorkReportClient, to_store_rows
@@ -63,6 +63,8 @@ class Validator:
             self.evalset,
             concurrency=self.config.concurrency,
             access_token=config.router.access_token,
+            require_identity=self.config.require_endpoint_identity,
+            release_manifest_path=self.config.release_manifest_path,
         )
         self.dashboard = DashboardState()
         self.dashboard.phase = self.weights.name
@@ -228,7 +230,7 @@ class Validator:
             self.session,
             self.config.work_report_url,
             token=self.config.work_report_token,
-            secret=self.config.work_report_token,
+            secret=self.config.work_report_hmac_secret,
         )
         since = time.time() - self.config.window_days * 86400
 
@@ -312,7 +314,10 @@ class Validator:
 
             evaluation = self._evaluations.get(miner.hotkey)
             row = self.store.qualification(miner.hotkey)
-            qualified = bool(row and row["passed"]) if row else False
+            qualified = (
+                bool(row and row["passed"])
+                and qualification_is_fresh(row)
+            ) if row else False
             resource_multiplier = (
                 evaluation.resource_multiplier if evaluation else 1.0
             )

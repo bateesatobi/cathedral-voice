@@ -351,7 +351,7 @@ main() {
     --name "${CONTAINER_NAME}" \
     --restart unless-stopped \
     --gpus "device=${devices}" \
-    -p "${TTS_HOST_PORT}:8002" \
+    -p "127.0.0.1:${TTS_HOST_PORT}:8002" \
     -e HF_TOKEN="${DEFAULT_HF_TOKEN}" \
     -e HUGGING_FACE_HUB_TOKEN="${DEFAULT_HF_TOKEN}" \
     -e MODEL_NAME="${MODEL_NAME}" \

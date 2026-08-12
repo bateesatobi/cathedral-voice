@@ -1,0 +1,25 @@
+{
+  "version": "1.4.0",
+  "notes": [
+    "Official Violet inference images. Validators compare miner-declared digests against allowed_digests.",
+    "Populate allowed_digests with sha256:... values when images are pinned for a release.",
+    "An empty allowed_digests list disables digest enforcement for that service (bootstrap only)."
+  ],
+  "images": {
+    "asr": {
+      "repository": "simonallanachuka/etoil-api",
+      "allowed_tags": ["latest"],
+      "allowed_digests": []
+    },
+    "asr_speaches": {
+      "repository": "ghcr.io/speaches-ai/speaches",
+      "allowed_tags": ["latest-cuda"],
+      "allowed_digests": []
+    },
+    "tts": {
+      "repository": "ghcr.io/cathedral-voice/spark-tts",
+      "allowed_tags": ["latest"],
+      "allowed_digests": []
+    }
+  }
+}

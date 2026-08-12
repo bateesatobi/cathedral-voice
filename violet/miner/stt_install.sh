@@ -165,7 +165,7 @@ services:
       NVIDIA_VISIBLE_DEVICES: "${devices}"
       CUDA_VISIBLE_DEVICES: "$(gpu_index_list "$(gpu_device_count "$devices")")"
     ports:
-      - "${SPEACHES_HOST_PORT_BASE}:8000"
+      - "127.0.0.1:${SPEACHES_HOST_PORT_BASE}:8000"
     deploy:
       resources:
         reservations:
@@ -184,7 +184,7 @@ ${device_yaml}
     restart: unless-stopped
     networks: [stt-net]
     ports:
-      - "\${ETOIL_HOST_PORT:-9090}:8000"
+      - "127.0.0.1:\${ETOIL_HOST_PORT:-9090}:8000"
     volumes:
       - stt-audio:/app/audio
     environment:
@@ -232,7 +232,7 @@ write_compose_per_gpu_speaches() {
       NVIDIA_VISIBLE_DEVICES: \"${id}\"
       CUDA_VISIBLE_DEVICES: \"0\"
     ports:
-      - \"${port}:8000\"
+      - \"127.0.0.1:${port}:8000\"
     deploy:
       resources:
         reservations:
@@ -300,7 +300,7 @@ ${depends_list}
     restart: unless-stopped
     networks: [stt-net]
     ports:
-      - "\${ETOIL_HOST_PORT:-9090}:8000"
+      - "127.0.0.1:\${ETOIL_HOST_PORT:-9090}:8000"
     volumes:
       - stt-audio:/app/audio
     environment:

@@ -19,7 +19,7 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import aiohttp
 import websockets
@@ -38,6 +38,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from ..config import MinerConfig
 from ..constants import SERVICE_ASR, SERVICE_TTS, SPEC_VERSION
+from ..identity import challenge_message
 from ..protocol import (
     HEADER_MINER_HOTKEY,
     HEADER_MINER_UID,
@@ -45,6 +46,7 @@ from ..protocol import (
     PATH_ASR_TRANSCRIBE,
     PATH_CAPACITY,
     PATH_HEALTH,
+    PATH_IDENTITY_CHALLENGE,
     PATH_INFO,
     PATH_TTS_CLONE,
     PATH_TTS_STREAM,
@@ -72,10 +74,18 @@ _HOP_BY_HOP = {
 class MinerState:
     """Mutable runtime state shared by the routes."""
 
-    def __init__(self, config: MinerConfig, hotkey: str = "", uid: Optional[int] = None):
+    def __init__(
+        self,
+        config: MinerConfig,
+        hotkey: str = "",
+        uid: Optional[int] = None,
+        *,
+        identity_signer: Optional[Callable[[str, str, float], str]] = None,
+    ):
         self.config = config
         self.hotkey = hotkey
         self.uid = uid
+        self.identity_signer = identity_signer
         self.started_at = time.time()
 
         self.gpu = GpuMonitor(poll_interval_s=config.gpu_poll_interval_s)
@@ -169,6 +179,24 @@ def _passthrough_headers(upstream_headers: Dict[str, str]) -> Dict[str, str]:
     }
 
 
+async def _read_upload_limited(upload: UploadFile, max_bytes: int) -> bytes:
+    """Read an upload with a hard byte cap."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        piece = await upload.read(256 * 1024)
+        if not piece:
+            break
+        total += len(piece)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"upload exceeds limit of {max_bytes} bytes",
+            )
+        chunks.append(piece)
+    return b"".join(chunks)
+
+
 def create_app(state: MinerState) -> FastAPI:
     """Build the miner's FastAPI application."""
 
@@ -204,17 +232,34 @@ def create_app(state: MinerState) -> FastAPI:
     # -- access control ----------------------------------------------------
 
     def _authorize(authorization: Optional[str]) -> None:
-        """Enforce the optional shared secret on inference traffic.
-
-        Deliberately not applied to /health, /capacity or /violet/info:
-        validators must be able to evaluate a miner without holding its token,
-        otherwise a miner could dodge evaluation by rejecting unknown callers.
-        """
+        """Enforce the optional shared secret on inference traffic."""
         expected = state.config.access_token
         if not expected:
             return
         if authorization != f"Bearer {expected}":
             raise HTTPException(status_code=401, detail="invalid or missing bearer token")
+
+    def _ws_authorized(websocket: WebSocket) -> bool:
+        """Check bearer token on WebSocket (header or ``?token=`` query param)."""
+        expected = state.config.access_token
+        if not expected:
+            return True
+        auth = websocket.headers.get("authorization") or websocket.headers.get("Authorization")
+        if auth == f"Bearer {expected}":
+            return True
+        return websocket.query_params.get("token") == expected
+
+    @app.middleware("http")
+    async def limit_request_body_size(request: Request, call_next):
+        max_bytes = state.config.max_upload_bytes
+        if max_bytes > 0:
+            content_length = request.headers.get("content-length")
+            if content_length and int(content_length) > max_bytes:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": f"request body exceeds {max_bytes} bytes"},
+                )
+        return await call_next(request)
 
     # -- control plane -----------------------------------------------------
 
@@ -256,6 +301,31 @@ def create_app(state: MinerState) -> FastAPI:
             headers=state.identity_headers(),
         )
 
+    @app.get(PATH_IDENTITY_CHALLENGE)
+    async def identity_challenge(nonce: str) -> JSONResponse:
+        """Sign a validator nonce with this miner's hotkey."""
+        nonce = (nonce or "").strip()
+        if len(nonce) < 8:
+            raise HTTPException(status_code=400, detail="nonce must be at least 8 characters")
+        if not state.hotkey:
+            raise HTTPException(status_code=503, detail="hotkey not configured")
+        if state.identity_signer is None:
+            raise HTTPException(
+                status_code=503,
+                detail="identity signing unavailable (no wallet connected)",
+            )
+        issued_at = time.time()
+        signature = state.identity_signer(state.hotkey, nonce, issued_at)
+        return JSONResponse(
+            {
+                "hotkey": state.hotkey,
+                "nonce": nonce,
+                "issued_at": issued_at,
+                "signature": signature,
+            },
+            headers=state.identity_headers(),
+        )
+
     # -- ASR ---------------------------------------------------------------
 
     @app.post(PATH_ASR_TRANSCRIBE)
@@ -274,7 +344,7 @@ def create_app(state: MinerState) -> FastAPI:
         if not state.serves_asr:
             raise HTTPException(status_code=404, detail="this miner does not serve ASR")
 
-        payload = await file.read()
+        payload = await _read_upload_limited(file, state.config.max_upload_bytes)
         try:
             async with state.asr_slots.acquire():
                 form = aiohttp.FormData()
@@ -305,20 +375,23 @@ def create_app(state: MinerState) -> FastAPI:
         if not state.serves_asr:
             await websocket.close(code=1008, reason="ASR not served by this miner")
             return
-        await websocket.accept()
+        if not _ws_authorized(websocket):
+            await websocket.close(code=1008, reason="unauthorized")
+            return
 
         mode = (state.config.asr_stream_mode or "batch_proxy").strip().lower()
         try:
             async with state.asr_slots.acquire():
+                await websocket.accept()
                 if mode in {"bridge", "upstream", "proxy"}:
                     target = (
                         f"{state.config.ws_base('asr')}"
                         f"{PATH_ASR_STREAM_WS}?language={language}"
                     )
-                    await _bridge_websocket(websocket, target, binary_to_upstream=True)
+                    await _bridge_websocket(
+                        websocket, target, state=state, binary_to_upstream=True
+                    )
                 else:
-                    # Default: etoil/speaches are batch-first; synthesize partials
-                    # by re-transcribing the growing PCM buffer.
                     await _asr_stream_batch_proxy(websocket, state, language)
         except AtCapacity as exc:
             await websocket.close(code=1013, reason=str(exc))
@@ -349,6 +422,13 @@ def create_app(state: MinerState) -> FastAPI:
 
         if not (payload.get("text") or "").strip():
             raise HTTPException(status_code=400, detail="'text' is required")
+        text = str(payload["text"])
+        if len(text) > state.config.max_tts_text_chars:
+            raise HTTPException(
+                status_code=413,
+                detail=f"text exceeds {state.config.max_tts_text_chars} characters",
+            )
+        payload["text"] = text
 
         return await _proxy_stream(
             state, state.tts, state.tts_slots, PATH_TTS_STREAM, json_payload=payload
@@ -366,7 +446,9 @@ def create_app(state: MinerState) -> FastAPI:
         if not state.serves_tts:
             raise HTTPException(status_code=404, detail="this miner does not serve TTS")
 
-        audio = await reference_audio.read()
+        audio = await _read_upload_limited(
+            reference_audio, state.config.max_clone_reference_bytes
+        )
         form = aiohttp.FormData()
         form.add_field("text", text)
         form.add_field("temperature", str(temperature))
@@ -402,12 +484,17 @@ def create_app(state: MinerState) -> FastAPI:
         if not state.serves_tts:
             await websocket.close(code=1008, reason="TTS not served by this miner")
             return
-        await websocket.accept()
+        if not _ws_authorized(websocket):
+            await websocket.close(code=1008, reason="unauthorized")
+            return
 
         target = f"{state.config.ws_base('tts')}{PATH_TTS_STREAM_WS}"
         try:
             async with state.tts_slots.acquire():
-                await _bridge_websocket(websocket, target, binary_to_upstream=False)
+                await websocket.accept()
+                await _bridge_websocket(
+                    websocket, target, state=state, binary_to_upstream=False
+                )
         except AtCapacity as exc:
             await websocket.close(code=1013, reason=str(exc))
         except WebSocketDisconnect:
@@ -553,11 +640,20 @@ async def _asr_stream_batch_proxy(
                 text = body.decode("utf-8", errors="ignore").strip()
         if text:
             last_text = text
+        # Batch upstream returns the full line immediately; emit a growing
+        # prefix so clients see progressive partials over WebSocket.
+        words = last_text.split()
+        if words and not final:
+            bytes_per_word = 16000 * 2 // 2  # ~0.5 s of PCM per word
+            visible = min(len(words), max(1, len(pcm) // max(bytes_per_word, 1)))
+            emit_text = " ".join(words[:visible])
+        else:
+            emit_text = last_text
         await client_ws.send_text(
             json.dumps(
                 {
                     "type": "final" if final else "partial",
-                    "text": last_text,
+                    "text": emit_text,
                     "is_final": bool(final),
                     "language": language,
                 }
@@ -566,7 +662,10 @@ async def _asr_stream_batch_proxy(
 
     try:
         while True:
-            message = await client_ws.receive()
+            message = await asyncio.wait_for(
+                client_ws.receive(),
+                timeout=state.config.ws_idle_timeout_s,
+            )
             kind = message.get("type")
             if kind == "websocket.disconnect":
                 break
@@ -584,35 +683,38 @@ async def _asr_stream_batch_proxy(
 
 
 async def _bridge_websocket(
-    client_ws: WebSocket, target_url: str, *, binary_to_upstream: bool
+    client_ws: WebSocket,
+    target_url: str,
+    *,
+    state: MinerState,
+    binary_to_upstream: bool,
 ) -> None:
-    """Pipe a client WebSocket to the upstream container in both directions.
-
-    ``binary_to_upstream`` selects the ASR shape (client sends raw PCM frames)
-    versus the TTS shape (client sends JSON control frames). Both directions run
-    until either side closes; the first task to finish cancels the other so a
-    half-open socket cannot linger holding a concurrency slot.
-    """
-    async with websockets.connect(target_url, max_size=None) as upstream_ws:
+    """Pipe a client WebSocket to the upstream container in both directions."""
+    max_size = state.config.ws_max_message_bytes or None
+    idle_s = state.config.ws_idle_timeout_s
+    async with websockets.connect(target_url, max_size=max_size) as upstream_ws:
 
         async def client_to_upstream() -> None:
             while True:
-                message = await client_ws.receive()
+                message = await asyncio.wait_for(client_ws.receive(), timeout=idle_s)
                 kind = message.get("type")
                 if kind == "websocket.disconnect":
                     await upstream_ws.close()
                     return
-                if message.get("bytes") is not None:
-                    await upstream_ws.send(message["bytes"])
+                raw = message.get("bytes")
+                if raw is not None:
+                    if max_size and len(raw) > max_size:
+                        logger.warning("dropping oversize WS frame (%d bytes)", len(raw))
+                        continue
+                    await upstream_ws.send(raw)
                 elif message.get("text") is not None:
                     text = message["text"]
+                    if max_size and len(text.encode()) > max_size:
+                        logger.warning("dropping oversize WS text frame")
+                        continue
                     if binary_to_upstream:
-                        # An ASR client sending text is signalling end-of-audio
-                        # or a control command; forward it unchanged.
                         await upstream_ws.send(text)
                     else:
-                        # Validate JSON early so a malformed frame fails here
-                        # with a clear log rather than inside the model server.
                         try:
                             json.loads(text)
                         except json.JSONDecodeError:
@@ -621,8 +723,12 @@ async def _bridge_websocket(
                         await upstream_ws.send(text)
 
         async def upstream_to_client() -> None:
-            async for message in upstream_ws:
+            while True:
+                message = await asyncio.wait_for(upstream_ws.recv(), timeout=idle_s)
                 if isinstance(message, (bytes, bytearray)):
+                    if max_size and len(message) > max_size:
+                        logger.warning("dropping oversize upstream frame")
+                        continue
                     await client_ws.send_bytes(bytes(message))
                 else:
                     await client_ws.send_text(message)

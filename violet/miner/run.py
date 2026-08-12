@@ -15,13 +15,14 @@ import argparse
 import asyncio
 import contextlib
 import sys
-from typing import Optional
+from typing import Callable, Optional
 
 import uvicorn
 
 from ..chain import ChainClient
 from ..config import load_config
 from ..logging_utils import setup_logging
+from ..identity import challenge_message
 from .announce import Announcer
 from .server import MinerState, create_app
 
@@ -63,6 +64,21 @@ async def _resolve_identity(chain: ChainClient) -> tuple[str, Optional[int]]:
     return hotkey, int(neuron.uid)
 
 
+    finally:
+        await transcribe_buffer(final=True)
+
+
+def _make_identity_signer(chain) -> Optional[Callable[[str, str, float], str]]:
+    if chain is None or not chain.config.signing_enabled:
+        return None
+
+    def sign(hotkey: str, nonce: str, issued_at: float) -> str:
+        message = challenge_message(hotkey, nonce, issued_at)
+        return chain.wallet.hotkey.sign(message).hex()
+
+    return sign
+
+
 async def _serve(args: argparse.Namespace) -> int:
     config = load_config()
     miner_config = config.miner
@@ -93,7 +109,12 @@ async def _serve(args: argparse.Namespace) -> int:
                 await chain.close()
             return 2
 
-    state = MinerState(miner_config, hotkey=hotkey, uid=uid)
+    state = MinerState(
+        miner_config,
+        hotkey=hotkey,
+        uid=uid,
+        identity_signer=_make_identity_signer(chain),
+    )
     app = create_app(state)
 
     if chain is not None and not args.no_announce:

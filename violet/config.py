@@ -184,9 +184,25 @@ class MinerConfig:
     serve_axon: bool = field(default_factory=lambda: _env_bool("MINER_SERVE_AXON", True))
 
     #: Optional shared secret. When set, the miner requires this bearer token on
-    #: production traffic; validators are always allowed through unauthenticated
-    #: so that qualification cannot be dodged.
+    #: inference traffic (HTTP and WebSocket). Health/capacity/info stay open so
+    #: validators can evaluate without holding the product token.
     access_token: str = field(default_factory=lambda: _env("MINER_ACCESS_TOKEN"))
+
+    max_upload_bytes: int = field(
+        default_factory=lambda: _env_int("MINER_MAX_UPLOAD_BYTES", 50 * 1024 * 1024)
+    )
+    max_clone_reference_bytes: int = field(
+        default_factory=lambda: _env_int("MINER_MAX_CLONE_REFERENCE_BYTES", 10 * 1024 * 1024)
+    )
+    max_tts_text_chars: int = field(
+        default_factory=lambda: _env_int("MINER_MAX_TTS_TEXT_CHARS", 5000)
+    )
+    ws_max_message_bytes: int = field(
+        default_factory=lambda: _env_int("MINER_WS_MAX_MESSAGE_BYTES", 4 * 1024 * 1024)
+    )
+    ws_idle_timeout_s: float = field(
+        default_factory=lambda: _env_float("MINER_WS_IDLE_TIMEOUT_S", 300.0)
+    )
 
     def validate(self) -> None:
         unknown = set(self.services) - set(SERVICES)
@@ -263,9 +279,21 @@ class ValidatorConfig:
     #: Avoices work-report endpoint, providing signed usage counters per hotkey
     #: (TDD 7 Work score). Empty disables the Work component's organic input.
     work_report_url: str = field(default_factory=lambda: _env("VIOLET_WORK_REPORT_URL"))
+    #: Bearer token for fetching work reports from the router (distinct from HMAC).
     work_report_token: str = field(default_factory=lambda: _env("VIOLET_WORK_REPORT_TOKEN"))
+    #: HMAC secret for verifying report signatures. Falls back to token only when unset.
+    work_report_hmac_secret: str = field(
+        default_factory=lambda: _env("VIOLET_WORK_REPORT_HMAC_SECRET")
+        or _env("VIOLET_WORK_REPORT_TOKEN")
+    )
     #: Ed25519/sr25519 public key (SS58) expected to have signed work reports.
     work_report_signer: str = field(default_factory=lambda: _env("VIOLET_WORK_REPORT_SIGNER"))
+    release_manifest_path: str = field(
+        default_factory=lambda: _env("VIOLET_RELEASE_MANIFEST_PATH")
+    )
+    require_endpoint_identity: bool = field(
+        default_factory=lambda: _env_bool("VALIDATOR_REQUIRE_IDENTITY", True)
+    )
 
     #: Bind address for the public scoring dashboard (TDD 9.3 mitigation roadmap).
     dashboard_host: str = field(default_factory=lambda: _env("VALIDATOR_DASHBOARD_HOST", "0.0.0.0"))

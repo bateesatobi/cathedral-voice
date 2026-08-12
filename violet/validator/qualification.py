@@ -34,11 +34,14 @@ from ..constants import (
 )
 from ..evalset import EvalSet
 from ..protocol import CapacityReport, HealthReport
+from ..releases import ReleaseManifest, load_release_manifest
 from .probes import MinerProbe, ProbeResult
 
 logger = logging.getLogger("violet.validator.qualification")
 
 TEST_HEALTH = "health_connectivity"
+TEST_IDENTITY = "endpoint_identity"
+TEST_IMAGES = "official_images"
 TEST_ASR = "asr_functional"
 TEST_TTS = "tts_functional"
 TEST_STREAMING = "streaming"
@@ -47,6 +50,8 @@ TEST_RESOURCES = "resource_accuracy"
 
 ALL_TESTS = (
     TEST_HEALTH,
+    TEST_IDENTITY,
+    TEST_IMAGES,
     TEST_ASR,
     TEST_TTS,
     TEST_STREAMING,
@@ -123,6 +128,8 @@ async def run_qualification(
     seed: int = 0,
     max_wer: float = QUALIFY_MAX_WER,
     skip_availability: bool = False,
+    require_identity: bool = True,
+    release_manifest: Optional[ReleaseManifest] = None,
 ) -> QualificationResult:
     """Run the full suite against one miner."""
     result = QualificationResult(hotkey=probe.hotkey, endpoint=probe.endpoint)
@@ -147,9 +154,91 @@ async def run_qualification(
         # Nothing else can be measured against an unreachable miner. Record the
         # remaining tests as failed-by-dependency so the operator sees the
         # cause rather than five unexplained failures.
-        for name in (TEST_ASR, TEST_TTS, TEST_STREAMING, TEST_AVAILABILITY, TEST_RESOURCES):
+        for name in (
+            TEST_IDENTITY,
+            TEST_IMAGES,
+            TEST_ASR,
+            TEST_TTS,
+            TEST_STREAMING,
+            TEST_AVAILABILITY,
+            TEST_RESOURCES,
+        ):
             result.outcomes.append(
                 TestOutcome(name, passed=False, detail="skipped: miner unreachable")
+            )
+        return result
+
+        return result
+
+    # 1b. Endpoint identity -----------------------------------------------
+    if require_identity:
+        identity_probe = await probe.verify_identity(timeout_s=QUALIFY_HEALTH_TIMEOUT_S)
+        if identity_probe.payload.get("skipped"):
+            result.outcomes.append(
+                TestOutcome(
+                    TEST_IDENTITY,
+                    True,
+                    identity_probe.detail,
+                    skipped=True,
+                )
+            )
+        else:
+            result.outcomes.append(
+                TestOutcome(
+                    TEST_IDENTITY,
+                    identity_probe.ok,
+                    identity_probe.detail,
+                    measurements={"latency_ms": round(identity_probe.latency_ms, 1)},
+                )
+            )
+            if not identity_probe.ok:
+                for name in (
+                    TEST_IMAGES,
+                    TEST_ASR,
+                    TEST_TTS,
+                    TEST_STREAMING,
+                    TEST_AVAILABILITY,
+                    TEST_RESOURCES,
+                ):
+                    result.outcomes.append(
+                        TestOutcome(name, passed=False, detail="skipped: identity check failed")
+                    )
+                return result
+    else:
+        result.outcomes.append(
+            TestOutcome(TEST_IDENTITY, True, "disabled by configuration", skipped=True)
+        )
+
+    # 1c. Official image declarations -------------------------------------
+    manifest = release_manifest or load_release_manifest()
+    info = await probe.info(timeout_s=QUALIFY_HEALTH_TIMEOUT_S)
+    image_failures: List[str] = []
+    if info:
+        if SERVICE_ASR in services and info.get("asr_image"):
+            ok, detail = manifest.check_declared("asr", str(info.get("asr_image", "")))
+            if not ok:
+                image_failures.append(f"asr: {detail}")
+        if SERVICE_TTS in services and info.get("tts_image"):
+            ok, detail = manifest.check_declared("tts", str(info.get("tts_image", "")))
+            if not ok:
+                image_failures.append(f"tts: {detail}")
+    result.outcomes.append(
+        TestOutcome(
+            TEST_IMAGES,
+            passed=not image_failures,
+            detail="; ".join(image_failures) if image_failures else "declared images allowed",
+        )
+    )
+    if image_failures:
+        for name in (
+            TEST_ASR,
+            TEST_TTS,
+            TEST_STREAMING,
+            TEST_AVAILABILITY,
+            TEST_RESOURCES,
+        ):
+            result.outcomes.append(
+                TestOutcome(name, passed=False, detail="skipped: image policy failed")
             )
         return result
 
@@ -246,7 +335,11 @@ async def run_qualification(
     else:
         # Every offered service must stream. A miner that streams TTS but not
         # ASR cannot serve the ASR half of a real-time session.
-        failed = [r for r in stream_results if not r.ok]
+        failed = [
+            r
+            for r in stream_results
+            if not r.ok or not r.payload.get("progressive", False)
+        ]
         first_bytes = [r.first_byte_ms for r in stream_results if r.first_byte_ms is not None]
         result.outcomes.append(
             TestOutcome(

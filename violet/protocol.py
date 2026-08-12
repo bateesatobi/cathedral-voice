@@ -51,6 +51,8 @@ PATH_TTS_STREAM_WS = "/v1/audio/speech/stream/ws"
 PATH_HEALTH = "/health"
 PATH_CAPACITY = "/capacity"
 PATH_INFO = "/violet/info"
+#: Hotkey binding challenge (see :mod:`violet.identity`).
+PATH_IDENTITY_CHALLENGE = "/violet/identity/challenge"
 
 #: Response headers a miner sets on TTS audio so the caller can frame the PCM
 #: without guessing. Mirrors what the current TTS server emits.

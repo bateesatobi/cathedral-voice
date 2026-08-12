@@ -149,7 +149,27 @@ admission_checklist() {
   echo "       nc -vz <public-ip> ${port}"
   print_public_reachability_hint "$port" "$ep"
 
-  echo " [4] Announce dry-run (prod)"
+  echo " [4] Miner access token (production traffic auth)"
+  if [[ -n "${MINER_ACCESS_TOKEN:-}" ]]; then
+    echo "     OK  MINER_ACCESS_TOKEN is set"
+  elif [[ "${FETCH_MINER_TOKEN:-0}" == "1" ]]; then
+    if [[ -x "${SCRIPT_DIR}/fetch_access_token.sh" ]]; then
+      if VIOLET_TOKEN_API_URL="${VIOLET_TOKEN_API_URL:-https://phosai-backend-api-1.onrender.com}" \
+        "${SCRIPT_DIR}/fetch_access_token.sh" "${MODE}" --env-file "${ROOT}/.env"; then
+        echo "     OK  fetched MINER_ACCESS_TOKEN"
+      else
+        echo "     FAIL token fetch — set VIOLET_MINER_TOKEN_MASTER_KEY on ASRAPI first"
+        fail=1
+      fi
+    else
+      echo "     FAIL fetch_access_token.sh missing"
+      fail=1
+    fi
+  else
+    echo "     skip — run: ./violet/miner/fetch_access_token.sh ${MODE} --write-env"
+  fi
+
+  echo " [5] Announce dry-run (prod)"
   if [[ "${MODE}" == "prod" || "${MODE}" == "production" ]]; then
     if [[ -f scripts/announce_endpoint.py ]] && command -v python3 >/dev/null 2>&1; then
       if python3 scripts/announce_endpoint.py --dry-run 2>&1 | tail -n 20; then
@@ -164,7 +184,7 @@ admission_checklist() {
     echo "     skip (mode=${MODE})"
   fi
 
-  echo " [5] Qualification (optional: BOOTSTRAP_QUALIFY=1)"
+  echo " [6] Qualification (optional: BOOTSTRAP_QUALIFY=1)"
   if [[ "${BOOTSTRAP_QUALIFY:-0}" == "1" ]]; then
     if [[ -f scripts/run_qualification.py ]] && command -v python3 >/dev/null 2>&1; then
       python3 scripts/run_qualification.py "http://127.0.0.1:${port}" \

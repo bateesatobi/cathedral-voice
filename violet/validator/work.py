@@ -78,6 +78,11 @@ def canonical_payload(report: WorkReport) -> bytes:
                 "service": entry.service,
                 "requests": entry.requests,
                 "seconds": round(entry.seconds, 3),
+                "mean_latency_ms": (
+                    round(entry.mean_latency_ms, 1)
+                    if entry.mean_latency_ms is not None
+                    else None
+                ),
             }
             for entry in sorted(report.entries, key=lambda e: (e.hotkey, e.service))
         ],

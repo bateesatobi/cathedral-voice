@@ -17,6 +17,7 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import aiohttp
 
@@ -115,12 +116,15 @@ class VioletRouter:
 
     # -- headers -----------------------------------------------------------
 
-    def _headers(self) -> Dict[str, str]:
-        return (
-            {"Authorization": f"Bearer {self.config.access_token}"}
-            if self.config.access_token
-            else {}
-        )
+    def _headers(self, miner: Optional[MinerEndpoint] = None) -> Dict[str, str]:
+        token = ""
+        if miner is not None and miner.access_token:
+            token = miner.access_token
+        elif self.config.access_token:
+            token = self.config.access_token
+        if not token:
+            return {}
+        return {"Authorization": f"Bearer {token}"}
 
     # -- ASR ---------------------------------------------------------------
 
@@ -230,7 +234,7 @@ class VioletRouter:
                 async with self.session.post(
                     f"{miner.endpoint}{PATH_TTS_STREAM}",
                     json=payload,
-                    headers=self._headers(),
+                    headers=self._headers(miner),
                     timeout=aiohttp.ClientTimeout(total=timeout_s),
                 ) as response:
                     if response.status != 200:
@@ -353,8 +357,15 @@ class VioletRouter:
         path = PATH_ASR_STREAM_WS if service == SERVICE_ASR else PATH_TTS_STREAM_WS
         if miner is not None:
             url = _to_ws(miner.endpoint) + path
+            params = []
             if service == SERVICE_ASR:
-                url = f"{url}?language={language}"
+                params.append(f"language={quote(language)}")
+            if miner.access_token:
+                params.append(f"token={quote(miner.access_token)}")
+            elif self.config.access_token:
+                params.append(f"token={quote(self.config.access_token)}")
+            if params:
+                url = f"{url}?{'&'.join(params)}"
             return url, miner, False
 
         fallback = (
@@ -433,7 +444,7 @@ class VioletRouter:
             miner.inflight += 1
             try:
                 async with self._open(
-                    method, f"{miner.endpoint}{path}", json_payload, build_data, timeout_s
+                    method, f"{miner.endpoint}{path}", json_payload, build_data, timeout_s, miner=miner
                 ) as response:
                     body = await response.read()
                     latency_ms = (time.perf_counter() - started) * 1000.0
@@ -514,8 +525,9 @@ class VioletRouter:
         build_data,
         timeout_s: float,
         extra_headers: Optional[Dict[str, str]] = None,
+        miner: Optional[MinerEndpoint] = None,
     ):
-        headers = {**self._headers(), **(extra_headers or {})}
+        headers = {**self._headers(miner), **(extra_headers or {})}
         timeout = aiohttp.ClientTimeout(total=timeout_s)
         if method == "GET":
             return self.session.get(url, headers=headers, timeout=timeout)

@@ -49,6 +49,27 @@ Capture check:
 python scripts/run_qualification.py http://127.0.0.1:8091 --services asr,tts
 ```
 
+### Miner access token (production auth)
+
+Avoices issues `MINER_ACCESS_TOKEN` after your hotkey proves registration on chain.
+Validators still reach `/health` without a token; product traffic from the router
+must present it when the miner enforces auth.
+
+**On ASRAPI (Render backend, not the frontend):** set `VIOLET_MINER_TOKEN_MASTER_KEY`
+on [phosai-backend-api-1.onrender.com](https://phosai-backend-api-1.onrender.com)
+(e.g. `openssl rand -hex 32`).
+
+**On the GPU host (after `btcli subnet register`):**
+
+```bash
+pip install -e ".[chain]"
+# Default API URL is the Render backend (not https://voices.phosaico.com)
+./violet/miner/fetch_access_token.sh test --write-env
+./violet/miner/start.sh test --no-follow   # reload sidecar with new .env
+```
+
+Or auto-fetch during bootstrap: `FETCH_MINER_TOKEN=1 ./violet/miner/bootstrap.sh test`
+
 ---
 
 ## What you need before you start
