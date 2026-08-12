@@ -63,9 +63,11 @@ W ≈ (log1p(requests) + log1p(stream_minutes)) × latency_multiplier
 Q ≈ mean_probe_quality × success_rate × availability
 ```
 
-- ASR: WER/CER-style probes (validators need a real audio corpus).
-- TTS: length / energy / silence / clipping sanity (not MOS).
+- **ASR:** WER against the **Sunbird/SALT** multispeaker test corpus (standard
+  build: `scripts/build_salt_evalset.py`). See [EVALSET.md](./EVALSET.md).
+- **TTS:** length / energy / silence / clipping sanity (not MOS).
 - Flaky miners get cut even if occasional answers look good.
+- Block-seeded rotation + holdout mitigate public-corpus overfitting.
 
 ---
 

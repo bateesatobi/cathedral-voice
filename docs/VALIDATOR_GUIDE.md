@@ -27,7 +27,7 @@ Validators probe miners, score **Capacity / Work / Quality**, and (optionally) p
 | **Docker + Docker Compose** | Recommended path (`start.sh`) |
 | **Python 3.10+** | Process mode, scripts, dry-run |
 | **Persistent disk** | `VALIDATOR_DB_PATH` holds the 7-day score window |
-| **Private evalset** | Real audio for meaningful WER (built-in set is not enough) |
+| **SALT evalset** | Real audio for WER — build with `scripts/build_salt_evalset.py` (see [EVALSET.md](./EVALSET.md)) |
 | **TAO** in coldkey wallet | Validator registration + weight transactions |
 
 Optional for **Work** scoring: PHOSAI work-report URL + HMAC secrets from ops.
@@ -65,7 +65,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 pip install -U pip wheel
-pip install -e ".[chain,cathedral,dev]"
+pip install -e ".[chain,cathedral,dev,eval]"
 ```
 
 | Extra | Purpose |
@@ -73,6 +73,7 @@ pip install -e ".[chain,cathedral,dev]"
 | `chain` | Bittensor SDK + metagraph / weights |
 | `cathedral` | SN39 thin relay crypto |
 | `dev` | pytest, httpx, qualification tooling |
+| `eval` | Build Sunbird/SALT Quality corpus (`datasets`, etc.) |
 
 There is no separate `requirements.txt` — **`pyproject.toml`** is the source of truth.
 
@@ -105,20 +106,24 @@ Fund the coldkey. Validators typically **stake** TAO on the subnet after registr
 
 ---
 
-### 6. Prepare a private evalset
+### 6. Prepare the standard SALT evalset (required for real WER)
 
-Point at a directory or manifest with **real audio** you control (not public benchmark leakage):
+Production Quality scoring needs **real audio**. The built-in corpus is synthetic
+and cannot measure WER.
 
-```bash
-mkdir -p /var/violet/evalset
-# copy your wav/mp3 + manifest per violet/evalset format
-```
-
-You will set:
+**Standard:** build from [Sunbird/salt](https://huggingface.co/datasets/Sunbird/salt)
+multispeaker **test** audio (East African langs used by Avoices).
 
 ```bash
-VALIDATOR_EVALSET_PATH=/var/violet/evalset
+pip install -e ".[eval]"
+python scripts/build_salt_evalset.py --out ./data/evalset/salt --per-lang 20 --seed 39
 ```
+
+```bash
+VALIDATOR_EVALSET_PATH=./data/evalset/salt
+```
+
+Details, holdout / anti-overfit rules, and manifest format: **[EVALSET.md](./EVALSET.md)**.
 
 ---
 
@@ -139,7 +144,7 @@ BT_WALLET_HOTKEY=my-validator
 VIOLET_PHASE=launch
 VIOLET_SCORE_WINDOW_DAYS=7
 VALIDATOR_DB_PATH=./data/validator.sqlite3
-VALIDATOR_EVALSET_PATH=/var/violet/evalset
+VALIDATOR_EVALSET_PATH=./data/evalset/salt
 VALIDATOR_DASHBOARD_PORT=8092
 VALIDATOR_DRY_RUN=true          # start here — no on-chain weights yet
 
@@ -326,11 +331,12 @@ Details: [INCENTIVE.md](./INCENTIVE.md)
 
 ## Rules
 
-1. Use a **private** evalset — built-in audio cannot measure real WER.
-2. Keep `VALIDATOR_DB_PATH` on **persistent disk**.
-3. Always **dry-run** before `VALIDATOR_DRY_RUN=false`.
-4. Work reports are **HMAC-signed** and **deduped** — miners cannot self-report Work.
-5. One earning hotkey per coldkey; sybil UIDs are zeroed.
+1. Use the **SALT standard evalset** (`VALIDATOR_EVALSET_PATH` → real audio). Built-in tones cannot measure WER — see [EVALSET.md](./EVALSET.md).
+2. Keep the **holdout** offline; rotate seed/holdout periodically (public SALT can be overfitted).
+3. Keep `VALIDATOR_DB_PATH` on **persistent disk**.
+4. Always **dry-run** before `VALIDATOR_DRY_RUN=false`.
+5. Work reports are **HMAC-signed** and **deduped** — miners cannot self-report Work.
+6. One earning hotkey per coldkey; sybil UIDs are zeroed.
 
 ---
 

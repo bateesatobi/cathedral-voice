@@ -70,9 +70,15 @@ Block-seeded rotation stops a miner learning the order of scored utterances. It
 does not stop a miner overfitting the corpus itself if the corpus is fixed and
 obtainable.
 
-Mitigations that are the *operator's* responsibility: keep the corpus private,
-and rotate it. The built-in corpus is explicitly a bootstrap set, and the
-validator says so at startup.
+The **standard** ASR corpus is [Sunbird/salt](https://huggingface.co/datasets/Sunbird/salt)
+multispeaker **test** audio (see [EVALSET.md](./EVALSET.md)). That set is public,
+so operators must:
+
+* keep the builder **holdout** offline;
+* rotate `--seed` / refresh holdout on a schedule;
+* preferably mix in private Avoices clips over time.
+
+The built-in package corpus remains a synthetic bootstrap only (no real WER).
 
 ### Validator collusion
 

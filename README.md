@@ -31,7 +31,7 @@ Full step-by-step runbooks (clone → Bittensor → deps → register → run �
 | Role | Guide | Steps |
 |------|-------|-------|
 | **Miner** | [docs/MINER_GUIDE.md](docs/MINER_GUIDE.md) | **1–13** — GPU host, Docker, `pip install -e ".[chain]"`, wallet, `.env`, inference, sidecar, qualify, register, announce |
-| **Validator** | [docs/VALIDATOR_GUIDE.md](docs/VALIDATOR_GUIDE.md) | **1–13** — Python/Docker, `pip install -e ".[chain,cathedral,dev]"`, evalset, dry-run, register, go live |
+| **Validator** | [docs/VALIDATOR_GUIDE.md](docs/VALIDATOR_GUIDE.md) · [docs/EVALSET.md](docs/EVALSET.md) | **1–13** — install, **SALT evalset**, dry-run, register, go live |
 
 **Dependencies:** no `requirements.txt` — install from `pyproject.toml`:
 
@@ -63,6 +63,7 @@ python scripts/announce_endpoint.py
 |-----|----------|
 | [docs/MINER_GUIDE.md](docs/MINER_GUIDE.md) | **Full miner runbook** (steps 1–13, testnet + mainnet) |
 | [docs/VALIDATOR_GUIDE.md](docs/VALIDATOR_GUIDE.md) | **Full validator runbook** (steps 1–13, testnet + mainnet) |
+| [docs/EVALSET.md](docs/EVALSET.md) | **SALT standard Quality corpus** (WER, holdout, anti-overfit) |
 | [docs/UNIFIED_SN39_VALIDATOR.md](docs/UNIFIED_SN39_VALIDATOR.md) | Voice + Cathedral thin SN39 in one process |
 | [docs/CATHEDRAL_EXTERNAL_SCORES.md](docs/CATHEDRAL_EXTERNAL_SCORES.md) | `POST /v1/external-scores/violet` contract |
 | [docs/INCENTIVE.md](docs/INCENTIVE.md) | Capacity / Work / Quality |
@@ -102,7 +103,7 @@ See **[VALIDATOR_GUIDE.md](docs/VALIDATOR_GUIDE.md)** for all 13 steps. Summary:
 3. `pip install -e ".[chain,cathedral,dev]"`
 4. `btcli`
 5. Create wallet
-6. Private evalset
+6. SALT evalset (`scripts/build_salt_evalset.py` → `VALIDATOR_EVALSET_PATH`)
 7. Configure `.env` (`VALIDATOR_DRY_RUN=true` first)
 8. `./violet/validator/start.sh test --miner http://…:8091`
 9. `btcli subnet register`

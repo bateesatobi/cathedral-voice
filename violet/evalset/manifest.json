@@ -1,10 +1,10 @@
 {
   "name": "violet-builtin-v1",
   "notes": [
-    "Built-in bootstrap corpus. ASR items carry no audio file, so audio is synthesised deterministically and WER is NOT measurable against them.",
-    "Production validators must point VALIDATOR_EVALSET_PATH at a private corpus with real audio, rotated on a schedule (TDD 9.3).",
-    "Add an 'audio_path' to each ASR item, relative to this manifest, to enable real WER scoring.",
-    "TTS items are fully usable as shipped: content fidelity is measured from the returned audio against the prompt text."
+    "Built-in bootstrap corpus only. ASR items have no audio files — WER is NOT measurable.",
+    "Production standard: build Sunbird/SALT multispeaker test audio via scripts/build_salt_evalset.py and set VALIDATOR_EVALSET_PATH (see docs/EVALSET.md).",
+    "Keep the salt-holdout slice private and rotate seeds periodically (TDD 9.3 / SECURITY.md).",
+    "TTS items are usable as shipped: content checks use the prompt text vs returned audio."
   ],
   "asr": [
     {

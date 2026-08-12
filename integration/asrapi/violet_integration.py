@@ -181,10 +181,17 @@ async def synthesize_via_violet(
             logger.warning("Violet synthesis returned HTTP %s", response.status)
             return None
 
+        h = {str(k).lower(): v for k, v in (response.headers or {}).items()}
+        width = int(h.get("x-audio-sample-width", 0) or 0)
+        bit_depth = int(h.get("x-bit-depth", 0) or 0)
+        if width > 0:
+            bit_depth = width * 8 if width <= 4 else width
+        elif bit_depth <= 0:
+            bit_depth = 16
         meta = {
-            "sample_rate": int(response.headers.get("x-audio-sample-rate", 24000)),
-            "channels": int(response.headers.get("x-audio-channels", 1)),
-            "sample_width": int(response.headers.get("x-audio-sample-width", 2)),
+            "sample_rate": int(h.get("x-audio-sample-rate") or h.get("x-sample-rate") or 16000),
+            "channels": int(h.get("x-audio-channels") or h.get("x-channels") or 1),
+            "bit_depth": bit_depth,
         }
         return response.body, meta
     except Exception as exc:

@@ -407,28 +407,30 @@ def create_app(state: MinerState) -> FastAPI:
     async def tts_stream(request: Request, authorization: Optional[str] = Header(None)):
         """Synthesis, streamed as raw PCM.
 
-        Contract matches ``ASRAPI/utils/tts_synthesis.py``: JSON body of
-        ``{text, speaker_id, temperature}``, PCM body out, framing carried in
-        the ``x-audio-*`` headers.
+        Accepts Spark-native ``{input, voice}`` or miner ``{text, speaker_id}`` JSON.
+        Upstream Spark always receives both field names.
         """
         _authorize(authorization)
         if not state.serves_tts:
             raise HTTPException(status_code=404, detail="this miner does not serve TTS")
 
         try:
-            payload = await request.json()
+            raw = await request.json()
         except Exception as exc:
             raise HTTPException(status_code=400, detail="body must be JSON") from exc
 
-        if not (payload.get("text") or "").strip():
-            raise HTTPException(status_code=400, detail="'text' is required")
-        text = str(payload["text"])
+        text = (raw.get("text") or raw.get("input") or "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="'text' or 'input' is required")
         if len(text) > state.config.max_tts_text_chars:
             raise HTTPException(
                 status_code=413,
                 detail=f"text exceeds {state.config.max_tts_text_chars} characters",
             )
-        payload["text"] = text
+
+        # Spark selects timbre from ``voice`` (not ``speaker_id``). Never forward both
+        # naming schemes — Spark returns HTTP 422 (duplicate field).
+        payload = _spark_tts_upstream_payload(raw)
 
         return await _proxy_stream(
             state, state.tts, state.tts_slots, PATH_TTS_STREAM, json_payload=payload
@@ -504,6 +506,24 @@ def create_app(state: MinerState) -> FastAPI:
             await _safe_close(websocket, 1011)
 
     return app
+
+
+def _spark_tts_upstream_payload(raw: dict) -> dict:
+    """Map miner-facing JSON to Spark upstream (``input`` + ``voice`` only).
+
+    Spark rejects payloads that include both ``text`` and ``input`` (duplicate field).
+    """
+    text = (raw.get("text") or raw.get("input") or "").strip()
+    voice = (raw.get("speaker_id") or raw.get("voice") or "eng_female_1").strip()
+    try:
+        temperature = float(raw.get("temperature", 0.7))
+    except (TypeError, ValueError):
+        temperature = 0.7
+    return {
+        "input": text,
+        "voice": voice,
+        "temperature": temperature,
+    }
 
 
 async def _proxy_stream(

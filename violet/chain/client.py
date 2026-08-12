@@ -160,11 +160,28 @@ class ChainClient:
         graph = graph or await self.metagraph(commitments=True)
         out: Dict[str, MinerAnnouncement] = {}
 
-        for hotkey, commitment in (graph.commitments or {}).items():
+        uid_to_hotkey = {
+            int(neuron.uid): str(neuron.hotkey) for neuron in graph.neurons
+        }
+        hotkey_set = set(uid_to_hotkey.values())
+
+        for key, commitment in (graph.commitments or {}).items():
             data = getattr(commitment, "data", "") or ""
             announcement = decode_announcement(data)
-            if announcement:
-                out[str(hotkey)] = announcement
+            if not announcement:
+                continue
+            key_str = str(key)
+            if key_str in hotkey_set:
+                hotkey = key_str
+            else:
+                try:
+                    hotkey = uid_to_hotkey.get(int(key))
+                except (TypeError, ValueError):
+                    hotkey = None
+            if not hotkey:
+                logger.debug("skipping commitment with unknown key %r", key)
+                continue
+            out[hotkey] = announcement
 
         for neuron in graph.neurons:
             hotkey = str(neuron.hotkey)
@@ -291,8 +308,24 @@ def _axon_endpoint(neuron) -> Optional[str]:
     if not axon:
         return None
 
-    ip = getattr(axon, "ip", None) or (axon.get("ip") if isinstance(axon, dict) else None)
-    port = getattr(axon, "port", None) or (axon.get("port") if isinstance(axon, dict) else None)
+    ip = None
+    port = None
+    if isinstance(axon, str):
+        # Bittensor 11.x metagraph exposes axon as "ip:port".
+        if ":" in axon:
+            host_part, _, port_part = axon.rpartition(":")
+            ip = host_part.strip()
+            try:
+                port = int(port_part.strip())
+            except ValueError:
+                return None
+    else:
+        ip = getattr(axon, "ip", None) or (
+            axon.get("ip") if isinstance(axon, dict) else None
+        )
+        port = getattr(axon, "port", None) or (
+            axon.get("port") if isinstance(axon, dict) else None
+        )
     if not ip or not port:
         return None
 

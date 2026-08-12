@@ -11,10 +11,10 @@ here:
 * each evaluation round draws a **rotating subset**, seeded by block height, so
   a miner cannot learn which utterances are scored by observing past rounds.
 
-A small built-in set ships so a validator works out of the box. Operators
-running real evaluation should point ``VALIDATOR_EVALSET_PATH`` at a private,
-periodically refreshed corpus - a public corpus is, by construction, a corpus
-that can be overfitted.
+**Production standard:** build the Sunbird/SALT multispeaker test corpus with
+``scripts/build_salt_evalset.py`` and point ``VALIDATOR_EVALSET_PATH`` at it
+(see ``docs/EVALSET.md``). The built-in set is synthetic bootstrap only — WER
+is not measurable until real ``audio_path`` files are present.
 """
 
 from __future__ import annotations
@@ -197,8 +197,14 @@ def load_evalset(path: Optional[str] = None) -> EvalSet:
         logger.warning(
             "evaluation set '%s' has no real audio on disk. ASR word error rate "
             "cannot be measured, so the Quality component will be derived from "
-            "availability and latency alone. Point VALIDATOR_EVALSET_PATH at a "
-            "corpus with audio before treating Quality scores as meaningful.",
+            "availability and latency alone. Build the standard SALT corpus: "
+            "python scripts/build_salt_evalset.py --out ./data/evalset/salt "
+            "then set VALIDATOR_EVALSET_PATH (docs/EVALSET.md).",
+            evalset.name,
+        )
+    elif "salt" in evalset.name.lower():
+        logger.info(
+            "using SALT-standard evaluation set '%s' (real audio → WER enabled)",
             evalset.name,
         )
 

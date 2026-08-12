@@ -36,6 +36,13 @@ dev = [
     "httpx>=0.27",
     "cryptography>=42",
 ]
+# Build the standard Sunbird/SALT Quality corpus (scripts/build_salt_evalset.py).
+eval = [
+    "datasets>=2.18",
+    "numpy>=1.24",
+    "soundfile>=0.12",
+    "huggingface_hub>=0.22",
+]
 
 [project.scripts]
 violet-miner = "violet.miner.run:main"

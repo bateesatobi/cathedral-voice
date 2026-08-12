@@ -12,7 +12,9 @@ Use this before opening compensated testnet traffic to multiple operators.
 
 ## Validators
 
-- [ ] `VALIDATOR_EVALSET_PATH` points at a **private corpus with real audio**
+- [ ] `VALIDATOR_EVALSET_PATH` points at the **SALT standard corpus** (`./data/evalset/salt` after `scripts/build_salt_evalset.py`) — see [EVALSET.md](./EVALSET.md)
+- [ ] Evalset is **not** `synthetic_only` (dashboard / startup logs show real audio)
+- [ ] Holdout kept offline (`data/evalset/salt-holdout`)
 - [ ] `VIOLET_RELEASE_MANIFEST_PATH` pins allowed image digests
 - [ ] `VIOLET_WORK_REPORT_HMAC_SECRET` differs from bearer token
 - [ ] Qualification TTL enforced in scoring (`qualification_is_fresh`)
