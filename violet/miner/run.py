@@ -64,10 +64,6 @@ async def _resolve_identity(chain: ChainClient) -> tuple[str, Optional[int]]:
     return hotkey, int(neuron.uid)
 
 
-    finally:
-        await transcribe_buffer(final=True)
-
-
 def _make_identity_signer(chain) -> Optional[Callable[[str, str, float], str]]:
     if chain is None or not chain.config.signing_enabled:
         return None

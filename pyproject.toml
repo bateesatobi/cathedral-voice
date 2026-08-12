@@ -41,6 +41,7 @@ dev = [
 violet-miner = "violet.miner.run:main"
 violet-fetch-miner-token = "violet.miner.fetch_access_token:main"
 violet-validator = "violet.validator.run:main"
+violet-router = "violet.router.run:main"
 cathedral-voice-scores = "violet.cathedral.cli:main"
 
 [project.urls]

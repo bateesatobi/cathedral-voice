@@ -20,39 +20,66 @@ or response shape changes anywhere in ASRAPI.
 3. **Every helper returns `None` on failure**, and `None` means "use the existing
    code path". A subnet outage degrades Avoices to exactly today's behaviour.
 
-## Step 1 — install
+## Step 1 — router inside ASRAPI (default, no GPU)
+
+The Violet router is **CPU-only**. It discovers miners on-chain and proxies HTTP
+to them — it never runs ASR/TTS models.  GPU inference stays on miners.
+
+**Default for Render / ASRAPI:** the router runs **inside the same process** as
+ASRAPI.  No separate service, no `VIOLET_ROUTER_URL`, no extra port.
 
 ```bash
 cd ASRAPI
-pip install -e ../violet-subnet          # or: pip install violet-subnet
-cp ../violet-subnet/integration/asrapi/violet_integration.py utils/
+pip install "violet-subnet[chain] @ git+https://github.com/bateesatobi/cathedral-voice.git@main"
+# or monorepo: pip install -e ../violet-subnet[chain]
 ```
 
-Add to `ASRAPI/requirements.txt`:
+On startup, ASRAPI initialises an embedded router when `VIOLET_ROUTER_ENABLED=true`
+and `VIOLET_ROUTER_URL` is **unset**.
 
+### Optional: external router service
+
+Run a standalone router only if you want it off the Render box (e.g. closer to
+chain RPC or miners):
+
+```bash
+cd violet-subnet
+pip install -e ".[chain]"
+./violet/router/start.sh   # port 8090
 ```
-violet-subnet>=1.4.0
-```
+
+Then set on ASRAPI: `VIOLET_ROUTER_URL=https://your-router:8090`
 
 ## Step 2 — environment
 
+**On ASRAPI (Render)** — embedded router, CPU-only:
+
 ```bash
-# Off until you flip this.
-VIOLET_ROUTER_ENABLED=false
+VIOLET_ROUTER_ENABLED=true
+# Leave VIOLET_ROUTER_URL unset for embedded mode (default)
 
-VIOLET_NETUID=39           # mainnet; use 292 with BT_NETWORK=test
-BT_NETWORK=finney
+BT_NETWORK=test              # or finney for mainnet
+VIOLET_NETUID=292            # 39 on mainnet
 
-# Fallbacks: the servers Avoices uses today.
-VIOLET_FALLBACK_ASR_URL=http://31.56.109.67:9000
-VIOLET_FALLBACK_TTS_URL=https://laurine-unappropriable-unvolcanically.ngrok-free.app
+# Optional seed while chain discovery warms up
+VIOLET_STATIC_MINERS=http://93.120.231.186:40201
 
-# Shared with validators so they can verify work reports.
+VIOLET_FALLBACK_ASR_URL=
+VIOLET_FALLBACK_TTS_URL=
+
 VIOLET_WORK_REPORT_SIGNING_KEY=<long random secret>
 VIOLET_RECEIPTS_DB_PATH=/var/lib/avoices/violet_receipts.sqlite3
-
-# Optional: only route to miners with at least this on-chain incentive.
 VIOLET_ROUTER_MIN_INCENTIVE=0.0
+
+# Miner token issuance
+VIOLET_MINER_TOKEN_MASTER_KEY=<long random secret>
+```
+
+**Only if using an external router service**, also set:
+
+```bash
+VIOLET_ROUTER_URL=https://your-router-host:8090
+VIOLET_ROUTER_API_KEY=<shared secret>
 ```
 
 `VIOLET_RECEIPTS_DB_PATH` must be on a **persistent** volume. On Render, that
