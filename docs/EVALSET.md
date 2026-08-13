@@ -27,6 +27,7 @@ files**. The validator synthesises tones so health/latency probes still run, but
 | Scored set | `data/evalset/salt/manifest.json` + `audio/` → real WER |
 | Holdout | `data/evalset/salt-holdout/` → keep offline; rotate in later |
 | TTS prompts | Shipped in the same manifest (miner synthesises; no SALT studio audio required for v1) |
+| TTS private holdout | Optional `VALIDATOR_TTS_HOLDOUT_PATH` JSON prompts for semantic back-transcription (see [TTS_CONTRACT.md](./TTS_CONTRACT.md)) |
 
 SALT multispeaker audio is **natural / field** speech — appropriate for ASR
 probes that should look like product traffic.
@@ -102,6 +103,31 @@ Loader: `violet.evalset.load_evalset` (env ``VALIDATOR_EVALSET_PATH``).
 
 ---
 
+## TTS semantic scoring
+
+Waveform-only TTS checks catch stubs and silence; they do **not** prove the
+miner spoke the prompt. Production Cathedral Voice validation should enable a
+validator-owned ASR endpoint:
+
+```bash
+export VALIDATOR_TRUSTED_ASR_URL=http://127.0.0.1:9000   # /transcribe
+# optional private prompts (not the public SALT TTS list):
+export VALIDATOR_TTS_HOLDOUT_PATH=./data/evalset/tts-holdout.json
+# fail closed when trusted ASR is missing/empty (default when URL is set):
+export VALIDATOR_TTS_SEMANTIC_REQUIRED=1
+```
+
+**Synthetic / tone fixtures earn no production Q.** When the evalset is
+`synthetic_only`, ASR/TTS probe qualities are stored as null so they cannot
+inflate Quality. Use a real SALT (or private) corpus for scored Q.
+
+Example holdout template: `data/evalset/tts-holdout.example.json` (copy offline;
+never publish real prompts).
+
+Contract details: [TTS_CONTRACT.md](./TTS_CONTRACT.md).
+
+---
+
 ## Checklist
 
 - [ ] `.[eval]` installed; `build_salt_evalset.py` succeeded
@@ -109,3 +135,4 @@ Loader: `violet.evalset.load_evalset` (env ``VALIDATOR_EVALSET_PATH``).
 - [ ] Dashboard / logs: evalset is **not** `synthetic_only`
 - [ ] Holdout directory is **not** world-readable / not in the public image
 - [ ] Dry-run validator against a known-good miner; WER fields populate on ASR probes
+- [ ] (Cathedral Voice) trusted ASR URL configured; TTS probes report WER from back-transcription

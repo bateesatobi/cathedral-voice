@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import Callable, Dict, Optional
@@ -407,8 +408,9 @@ def create_app(state: MinerState) -> FastAPI:
     async def tts_stream(request: Request, authorization: Optional[str] = Header(None)):
         """Synthesis, streamed as raw PCM.
 
-        Accepts Spark-native ``{input, voice}`` or miner ``{text, speaker_id}`` JSON.
-        Upstream Spark always receives both field names.
+        Accepts Spark-native ``{input, voice}`` or legacy ``{text, speaker_id}``
+        JSON. Upstream Spark always receives ``{input, voice, temperature}``
+        only (see ``docs/TTS_CONTRACT.md``).
         """
         _authorize(authorization)
         if not state.serves_tts:
@@ -432,8 +434,24 @@ def create_app(state: MinerState) -> FastAPI:
         # naming schemes — Spark returns HTTP 422 (duplicate field).
         payload = _spark_tts_upstream_payload(raw)
 
+        from ..cathedral.receipt_v1 import receipt_buffer_from_env, receipt_enabled_from_env
+
+        if receipt_enabled_from_env() and receipt_buffer_from_env():
+            return await _proxy_stream_with_receipt(
+                state,
+                state.tts,
+                state.tts_slots,
+                PATH_TTS_STREAM,
+                json_payload=payload,
+            )
+
         return await _proxy_stream(
-            state, state.tts, state.tts_slots, PATH_TTS_STREAM, json_payload=payload
+            state,
+            state.tts,
+            state.tts_slots,
+            PATH_TTS_STREAM,
+            json_payload=payload,
+            extra_headers=_tts_receipt_headers(state, payload, audio=b""),
         )
 
     @app.post(PATH_TTS_CLONE)
@@ -495,7 +513,11 @@ def create_app(state: MinerState) -> FastAPI:
             async with state.tts_slots.acquire():
                 await websocket.accept()
                 await _bridge_websocket(
-                    websocket, target, state=state, binary_to_upstream=False
+                    websocket,
+                    target,
+                    state=state,
+                    binary_to_upstream=False,
+                    text_transform=_remap_tts_ws_control_frame,
                 )
         except AtCapacity as exc:
             await websocket.close(code=1013, reason=str(exc))
@@ -526,6 +548,149 @@ def _spark_tts_upstream_payload(raw: dict) -> dict:
     }
 
 
+def _remap_tts_ws_control_frame(text: str) -> str:
+    """Rewrite TTS WS JSON to Spark ``{input, voice, temperature}`` before upstream."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    if not isinstance(data, dict):
+        return text
+    # Non-synthesis control frames (eos / end / ping) pass through unchanged.
+    if not any(k in data for k in ("text", "input", "speaker_id", "voice")):
+        return text
+    remapped = _spark_tts_upstream_payload(data)
+    # Preserve non-conflicting control keys (e.g. type) without dual naming.
+    out = {
+        key: value
+        for key, value in data.items()
+        if key not in {"text", "input", "speaker_id", "voice", "temperature"}
+    }
+    out.update(remapped)
+    return json.dumps(out, separators=(",", ":"))
+
+
+def _tts_receipt_headers(
+    state: MinerState,
+    payload: dict,
+    *,
+    audio: bytes = b"",
+) -> Dict[str, str]:
+    """Optional hybrid receipt header.
+
+    With buffered audio + TDX simulation/key env, emits a complete ``ok`` receipt.
+    Otherwise emits honest ``unavailable`` (never forges attestation).
+    """
+    try:
+        from ..cathedral.receipt_v1 import (
+            HEADER_VOICE_RECEIPT,
+            GPU_STATUS_TRUSTED_NOT_ATTESTED,
+            build_receipt,
+            build_unavailable_receipt,
+            receipt_enabled_from_env,
+            request_hash,
+        )
+        from ..cathedral.tdx import (
+            simulate_controller_measurement,
+            tdx_simulation_enabled,
+        )
+    except Exception:
+        return {}
+    if not receipt_enabled_from_env():
+        return {}
+
+    input_text = str(payload.get("input") or "")
+    voice = str(payload.get("voice") or "")
+    temperature = float(payload.get("temperature") or 0.7)
+    ed25519_key = (os.getenv("VIOLET_RECEIPT_ED25519_PRIVATE_KEY") or "").strip()
+    hmac_secret = (os.getenv("VIOLET_RECEIPT_HMAC_SECRET") or "").strip()
+
+    if audio and (tdx_simulation_enabled() or os.getenv("VIOLET_TDX_MEASUREMENT")):
+        measurement = os.getenv("VIOLET_TDX_MEASUREMENT", "").strip()
+        if not measurement and tdx_simulation_enabled():
+            challenge = (os.getenv("VIOLET_TDX_CHALLENGE") or "violet-local").strip()
+            measurement = simulate_controller_measurement(
+                hotkey=state.hotkey,
+                challenge=challenge,
+                endpoint=os.getenv("VIOLET_PUBLIC_ENDPOINT", "http://127.0.0.1:8091"),
+            ).encode()
+        try:
+            receipt = build_receipt(
+                miner_hotkey=state.hotkey,
+                input_text=input_text,
+                voice=voice,
+                audio=audio,
+                temperature=temperature,
+                controller_measurement=measurement or None,
+                gpu_attestation_status=GPU_STATUS_TRUSTED_NOT_ATTESTED,
+                ed25519_private_key=ed25519_key,
+                hmac_secret=hmac_secret if not ed25519_key else "",
+            )
+        except Exception as exc:
+            logger.warning("complete receipt build failed: %s", exc)
+            receipt = build_unavailable_receipt(state.hotkey, reason="receipt_build_failed")
+            receipt.request_hash = request_hash(
+                input_text=input_text, voice=voice, temperature=temperature
+            )
+    else:
+        receipt = build_unavailable_receipt(
+            state.hotkey,
+            reason="tdx_unavailable" if not audio else "measurement_unavailable",
+        )
+        receipt.request_hash = request_hash(
+            input_text=input_text, voice=voice, temperature=temperature
+        )
+        if audio:
+            from ..cathedral.receipt_v1 import audio_content_hash
+
+            receipt.audio_content_hash = audio_content_hash(audio)
+
+    return {
+        HEADER_VOICE_RECEIPT: json.dumps(
+            receipt.to_dict(), sort_keys=True, separators=(",", ":")
+        )
+    }
+
+
+async def _proxy_stream_with_receipt(
+    state: MinerState,
+    upstream: UpstreamClient,
+    slots: Slots,
+    path: str,
+    *,
+    json_payload: dict,
+) -> Response:
+    """Buffer TTS audio so the receipt can bind ``audio_content_hash`` (G05)."""
+    audio = bytearray()
+    status = 200
+    upstream_headers: Dict[str, str] = {}
+    try:
+        async with slots.acquire():
+            iterator = upstream.stream_post(path, json_payload=json_payload)
+            async for head, chunk in iterator:
+                if head is not None:
+                    status, raw_headers = head
+                    upstream_headers = _passthrough_headers(raw_headers or {})
+                    continue
+                if chunk:
+                    audio.extend(chunk)
+    except AtCapacity as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except UpstreamError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+    headers = dict(upstream_headers)
+    headers.update(state.identity_headers())
+    headers.update(_tts_receipt_headers(state, json_payload, audio=bytes(audio)))
+    media_type = headers.pop("Content-Type", None) or "audio/pcm"
+    return Response(
+        content=bytes(audio),
+        status_code=int(status or 200),
+        media_type=media_type,
+        headers=headers,
+    )
+
+
 async def _proxy_stream(
     state: MinerState,
     upstream: UpstreamClient,
@@ -534,6 +699,7 @@ async def _proxy_stream(
     *,
     json_payload: Optional[dict] = None,
     data: Optional[aiohttp.FormData] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> Response:
     """Forward a streaming POST, holding a concurrency slot for its duration.
 
@@ -583,6 +749,8 @@ async def _proxy_stream(
     status = int(header_box.get("status", 200) or 200)
     upstream_headers = _passthrough_headers(header_box.get("headers", {}) or {})  # type: ignore[arg-type]
     upstream_headers.update(state.identity_headers())
+    if extra_headers:
+        upstream_headers.update(extra_headers)
     media_type = upstream_headers.pop("Content-Type", None) or "audio/pcm"
 
     async def replay():
@@ -708,6 +876,7 @@ async def _bridge_websocket(
     *,
     state: MinerState,
     binary_to_upstream: bool,
+    text_transform: Optional[Callable[[str], str]] = None,
 ) -> None:
     """Pipe a client WebSocket to the upstream container in both directions."""
     max_size = state.config.ws_max_message_bytes or None
@@ -740,6 +909,8 @@ async def _bridge_websocket(
                         except json.JSONDecodeError:
                             logger.warning("dropping non-JSON control frame")
                             continue
+                        if text_transform is not None:
+                            text = text_transform(text)
                         await upstream_ws.send(text)
 
         async def upstream_to_client() -> None:

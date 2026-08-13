@@ -32,6 +32,12 @@ from .qualification import (
     run_qualification,
 )
 from .store import Observation, ValidatorStore
+from .trusted_asr import (
+    holdout_path_from_env,
+    load_tts_holdout,
+    rotate_holdout,
+    trusted_asr_config_from_env,
+)
 
 logger = logging.getLogger("violet.validator.evaluator")
 
@@ -71,6 +77,24 @@ class Evaluator:
         self.availability_window_s = availability_window_s
         self.require_identity = require_identity
         self.release_manifest = load_release_manifest(release_manifest_path or None)
+        self.trusted_asr = trusted_asr_config_from_env()
+        self._tts_holdout: List = []
+        holdout = holdout_path_from_env()
+        if holdout:
+            try:
+                self._tts_holdout = load_tts_holdout(holdout)
+                logger.info(
+                    "loaded %d private TTS holdout prompts from %s",
+                    len(self._tts_holdout),
+                    holdout,
+                )
+            except Exception as exc:
+                logger.warning("TTS holdout load failed (%s): %s", holdout, exc)
+
+    def _tts_items(self, seed: int, count: int):
+        if self._tts_holdout:
+            return rotate_holdout(self._tts_holdout, seed, count)
+        return self.evalset.rotate_tts(seed, count)
 
     async def health_sweep(
         self, session: aiohttp.ClientSession, discovery: Discovery
@@ -89,6 +113,7 @@ class Evaluator:
                 probe = MinerProbe(
                     session, miner.endpoint,
                     hotkey=miner.hotkey, access_token=self.access_token,
+                    trusted_asr=self.trusted_asr,
                 )
                 result = await probe.health()
                 capacity_units = 0.0
@@ -172,7 +197,11 @@ class Evaluator:
         self, session: aiohttp.ClientSession, miner: MinerRecord, *, seed: int
     ) -> MinerEvaluation:
         probe = MinerProbe(
-            session, miner.endpoint, hotkey=miner.hotkey, access_token=self.access_token
+            session,
+            miner.endpoint,
+            hotkey=miner.hotkey,
+            access_token=self.access_token,
+            trusted_asr=self.trusted_asr,
         )
         evaluation = MinerEvaluation(miner=miner)
         now = time.time()
@@ -221,6 +250,22 @@ class Evaluator:
             probes = await self._quality_probes(probe, miner, seed=seed)
             evaluation.probes = probes
             for result in probes:
+                # Tone / synthetic fixtures measure latency and liveness only —
+                # they must not credit production Quality (Cathedral Voice G03).
+                quality = result.quality
+                detail = result.detail
+                if self.evalset.synthetic_only and result.kind in {
+                    "asr",
+                    "asr_stream",
+                    "tts",
+                    "tts_stream",
+                }:
+                    quality = None
+                    detail = (
+                        f"{detail}; synthetic corpus: Q not credited"
+                        if detail
+                        else "synthetic corpus: Q not credited"
+                    )
                 observations.append(
                     Observation(
                         hotkey=miner.hotkey,
@@ -230,9 +275,9 @@ class Evaluator:
                         ok=result.ok,
                         latency_ms=result.latency_ms,
                         first_byte_ms=result.first_byte_ms,
-                        quality=result.quality,
-                        wer=result.wer,
-                        detail=result.detail,
+                        quality=quality,
+                        wer=result.wer if not self.evalset.synthetic_only else None,
+                        detail=detail,
                     )
                 )
 
@@ -263,9 +308,9 @@ class Evaluator:
                 tasks.append(probe.asr_stream(stream_items[0]))
 
         if SERVICE_TTS in miner.services:
-            for item in self.evalset.rotate_tts(seed, 2):
+            for item in self._tts_items(seed, 2):
                 tasks.append(probe.tts_batch(item))
-            stream_items = self.evalset.rotate_tts(seed + 1, 1)
+            stream_items = self._tts_items(seed + 1, 1)
             if stream_items:
                 tasks.append(probe.tts_stream(stream_items[0]))
 

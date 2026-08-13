@@ -24,8 +24,10 @@ Audit reference: [cathedralai/cathedral-validator](https://github.com/cathedrala
 
 | Rule | Why |
 |------|-----|
-| `source: "violet_audio"` | Only allowed external sources are blended |
+| `source: "violet_audio"` | Legacy blended external source |
+| `source: "cathedral_voice_hybrid"` | Receipt-gated hybrid (see [CATHEDRAL_VOICE_RECEIPT_v1.md](./CATHEDRAL_VOICE_RECEIPT_v1.md)); **not** connected to subnet C/W/Q weights here |
 | **`complete: true`** | Incomplete reports are stored but **never blended** |
+| Honest GPU flags | Reports/receipts must set `gpu_attested=false`, `gpu_memory_confidential=false` |
 | Scores in `[0, 1]` | Publisher L1-normalizes |
 | Monotonic `epoch` | Older / conflicting epochs rejected |
 | Fresh `generated_at` | Default max age ~1 hour |
@@ -47,6 +49,12 @@ CATHEDRAL_EXTERNAL_SCORES_TOKEN=<from Cathedral ops>
 CATHEDRAL_EXTERNAL_SCORES_HMAC_SECRET=<if required>
 CATHEDRAL_EXTERNAL_SCORES_NETUID=39
 CATHEDRAL_EXTERNAL_SCORES_DRY_RUN=false
+
+# Hybrid intake (receipt-gated; does not change C/W/Q weights):
+# CATHEDRAL_HYBRID_SCORES_ENABLED=true
+# CATHEDRAL_HYBRID_ONLY=false          # true = skip violet_audio; fail closed without receipts
+# CATHEDRAL_RECEIPT_HMAC_SECRET=<receipt verify secret>
+# CATHEDRAL_HYBRID_REQUIRE_TDX=false   # true when live TDX quotes are required
 
 # Optional: only feed Cathedral SN39; skip Violet-subnet set_weights
 # CATHEDRAL_SKIP_LOCAL_WEIGHTS=true

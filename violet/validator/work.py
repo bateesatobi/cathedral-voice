@@ -131,6 +131,32 @@ def parse_report(payload: dict) -> WorkReport:
     )
 
 
+def reject_overlapping_report(
+    report: WorkReport,
+    *,
+    last_period_end: float,
+    last_report_id: Optional[str] = None,
+    epsilon_s: float = 1.0,
+) -> Optional[str]:
+    """Return a rejection reason if the report overlaps a prior cursor, else None."""
+    if last_report_id and report.report_id == last_report_id:
+        return "duplicate report_id (already at cursor)"
+    if last_period_end <= 0:
+        return None
+    # Exclusive window: next batch must start at/after the previous end.
+    if report.period_start + epsilon_s < last_period_end:
+        return (
+            f"overlapping period_start={report.period_start:.0f} "
+            f"< cursor={last_period_end:.0f}"
+        )
+    if report.generated_at + epsilon_s <= last_period_end:
+        return (
+            f"stale generated_at={report.generated_at:.0f} "
+            f"<= cursor={last_period_end:.0f}"
+        )
+    return None
+
+
 class WorkReportClient:
     """Pulls signed work reports from the Avoices backend."""
 
@@ -148,8 +174,18 @@ class WorkReportClient:
         self.secret = secret
         self._last_report_id: Optional[str] = None
 
-    async def fetch(self, since: float, *, timeout_s: float = 20.0) -> Optional[WorkReport]:
+    async def fetch(
+        self,
+        since: float,
+        *,
+        timeout_s: float = 20.0,
+        last_period_end: float = 0.0,
+        last_report_id: Optional[str] = None,
+    ) -> Optional[WorkReport]:
         """Fetch work completed since ``since``. Returns ``None`` on any failure.
+
+        ``since`` is an absolute unix timestamp. Overlapping / replayed batches
+        relative to ``last_period_end`` are rejected.
 
         Failure is non-fatal by design: the Work component simply contributes
         nothing that round. Halting a sweep because the product backend is
@@ -202,6 +238,15 @@ class WorkReportClient:
         now = time.time()
         if report.generated_at > now + 300:
             logger.error("work report %s is timestamped in the future; discarding", report.report_id)
+            return None
+
+        overlap = reject_overlapping_report(
+            report,
+            last_period_end=last_period_end,
+            last_report_id=last_report_id or self._last_report_id,
+        )
+        if overlap:
+            logger.warning("rejecting work report %s: %s", report.report_id, overlap)
             return None
 
         self._last_report_id = report.report_id

@@ -157,9 +157,17 @@ def create_app() -> FastAPI:
 
     @app.get("/v1/work-report", dependencies=[Depends(require_auth)])
     async def work_report(since: float = Query(7 * 86400.0, ge=0.0)) -> Dict[str, object]:
+        """Return a signed work report.
+
+        ``since`` may be an absolute unix timestamp (validator cursor) or a
+        duration in seconds (legacy). Values ``>= 1e9`` (~2001-09) are treated
+        as absolute starts.
+        """
         if _router is None:
             raise HTTPException(status_code=503, detail="router not started")
-        return _router.work_report(time.time() - since)
+        now = time.time()
+        period_start = since if since >= 1_000_000_000 else (now - since)
+        return _router.work_report(period_start)
 
     @app.post("/v1/transcribe", dependencies=[Depends(require_auth)])
     async def transcribe(

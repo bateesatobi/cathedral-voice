@@ -213,13 +213,17 @@ async def run_qualification(
     manifest = release_manifest or load_release_manifest()
     info = await probe.info(timeout_s=QUALIFY_HEALTH_TIMEOUT_S)
     image_failures: List[str] = []
-    if info:
-        if SERVICE_ASR in services and info.get("asr_image"):
-            ok, detail = manifest.check_declared("asr", str(info.get("asr_image", "")))
+    if info is None:
+        image_failures.append("/violet/info unavailable")
+    else:
+        if SERVICE_ASR in services:
+            declared = str(info.get("asr_image") or "").strip()
+            ok, detail = manifest.check_declared("asr", declared)
             if not ok:
                 image_failures.append(f"asr: {detail}")
-        if SERVICE_TTS in services and info.get("tts_image"):
-            ok, detail = manifest.check_declared("tts", str(info.get("tts_image", "")))
+        if SERVICE_TTS in services:
+            declared = str(info.get("tts_image") or "").strip()
+            ok, detail = manifest.check_declared("tts", declared)
             if not ok:
                 image_failures.append(f"tts: {detail}")
     result.outcomes.append(
@@ -294,7 +298,15 @@ async def run_qualification(
         tts_probe = None
     else:
         tts_probe = await probe.tts_batch(tts_item, timeout_s=QUALIFY_TTS_TIMEOUT_S)
+        # Semantic fail-closed zeros quality when trusted ASR is required and missing.
         passed = tts_probe.ok and (tts_probe.quality or 0.0) >= 0.5
+        measurements = {
+            "latency_ms": round(tts_probe.latency_ms, 1),
+            "quality": round(tts_probe.quality or 0.0, 4),
+            "first_byte_ms": round(tts_probe.first_byte_ms or 0.0, 1),
+        }
+        if tts_probe.wer is not None:
+            measurements["wer"] = round(tts_probe.wer, 4)
         result.outcomes.append(
             TestOutcome(
                 TEST_TTS,
@@ -305,11 +317,7 @@ async def run_qualification(
                     if tts_probe.ok
                     else tts_probe.detail
                 ),
-                measurements={
-                    "latency_ms": round(tts_probe.latency_ms, 1),
-                    "quality": round(tts_probe.quality or 0.0, 4),
-                    "first_byte_ms": round(tts_probe.first_byte_ms or 0.0, 1),
-                },
+                measurements=measurements,
             )
         )
 

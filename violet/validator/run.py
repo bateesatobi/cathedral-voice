@@ -232,17 +232,27 @@ class Validator:
             token=self.config.work_report_token,
             secret=self.config.work_report_hmac_secret,
         )
-        since = time.time() - self.config.window_days * 86400
+        window_start = time.time() - self.config.window_days * 86400
+        cursor_end, cursor_report_id = self.store.get_work_cursor()
+        since = max(window_start, cursor_end) if cursor_end > 0 else window_start
 
         while not self._stop.is_set():
             try:
-                report = await client.fetch(since)
+                cursor_end, cursor_report_id = self.store.get_work_cursor()
+                since = max(since, cursor_end) if cursor_end > 0 else since
+                report = await client.fetch(
+                    since,
+                    last_period_end=cursor_end,
+                    last_report_id=cursor_report_id,
+                )
                 if report:
                     ingested = 0
                     for row in to_store_rows(report):
                         if self.store.record_work(**row):
                             ingested += 1
                     logger.info("recorded %d new work rows", ingested)
+                    # Advance durable cursor only after successful ingest attempt.
+                    self.store.set_work_cursor(report.generated_at, report.report_id)
                     since = max(since, report.generated_at)
             except Exception as exc:
                 logger.error("work ingestion failed: %s", exc)
@@ -389,6 +399,9 @@ class Validator:
                         "window_days": self.config.window_days,
                         "violet_netuid": self.chain_config.netuid,
                         "scorer": "cathedral-voice",
+                        "gpu_attested": False,
+                        "gpu_memory_confidential": False,
+                        "execution_class": "hybrid_gpu_preview",
                     },
                 )
                 if not result.get("ok"):

@@ -100,6 +100,11 @@ CREATE TABLE IF NOT EXISTS coldkey_strikes (
     blacklisted  INTEGER NOT NULL DEFAULT 0,
     detail       TEXT
 );
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -235,6 +240,35 @@ class ValidatorStore:
         except sqlite3.IntegrityError:
             logger.debug("work report %s for %s already ingested", report_id, hotkey)
             return False
+
+    def get_meta(self, key: str) -> Optional[str]:
+        cursor = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        return str(row["value"]) if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO meta (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
+
+    def get_work_cursor(self) -> tuple[float, Optional[str]]:
+        """Persistent work ingest watermark ``(period_end, last_report_id)``."""
+        raw_end = self.get_meta("work_cursor_period_end")
+        report_id = self.get_meta("work_cursor_report_id")
+        try:
+            period_end = float(raw_end) if raw_end is not None else 0.0
+        except (TypeError, ValueError):
+            period_end = 0.0
+        return period_end, report_id
+
+    def set_work_cursor(self, period_end: float, report_id: str) -> None:
+        self.set_meta("work_cursor_period_end", f"{float(period_end):.6f}")
+        self.set_meta("work_cursor_report_id", str(report_id or ""))
 
     def record_qualification(
         self, hotkey: str, endpoint: str, passed: bool, detail: str, at: Optional[float] = None

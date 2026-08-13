@@ -11,11 +11,15 @@ to break, and it cannot be tested by patching it out.
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 import sys
 import threading
 import time
 from pathlib import Path
+
+# Integration / unit tests use unpinned mock images; production defaults to strict.
+os.environ.setdefault("VIOLET_REQUIRE_IMAGE_DIGESTS", "0")
 
 import pytest
 

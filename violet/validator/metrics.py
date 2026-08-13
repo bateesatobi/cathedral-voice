@@ -13,9 +13,11 @@ MOS model here - doing so would require a neural predictor in every validator,
 which contradicts the cheap-validator goal and would itself become the thing
 miners overfit to. Instead this module measures the signal-level properties that
 a broken or faked TTS response fails: audio length proportional to text, energy
-distribution, silence ratio, and clipping. That catches the failure modes worth
-catching at v1.4 and is documented as an approximation rather than dressed up as
-a naturalness score.
+distribution, silence ratio, and clipping.
+
+Cathedral Voice Brief 1 adds ``tts_semantic_score``: when a validator-owned
+trusted ASR is configured, TTS audio is back-transcribed and fused with the
+waveform score (fail closed if the hypothesis is missing).
 """
 
 from __future__ import annotations
@@ -146,6 +148,36 @@ def asr_quality(reference: str, hypothesis: str) -> float:
     cer = character_error_rate(reference, hypothesis)
     combined = 0.7 * wer + 0.3 * cer
     return max(0.0, 1.0 - combined)
+
+
+def tts_semantic_score(
+    reference_text: str,
+    hypothesis_text: Optional[str],
+    waveform_score: float,
+    *,
+    require_hypothesis: bool = True,
+    waveform_weight: float = 0.35,
+) -> tuple[float, str]:
+    """Combine waveform sanity with trusted-ASR back-transcription fidelity.
+
+    Cathedral Voice Brief 1: waveform checks alone do not prove the miner spoke
+    the prompt. When ``require_hypothesis`` is true (fail-closed mode), a
+    missing or empty hypothesis zeros the score even if the waveform looks fine.
+    """
+    wave = max(0.0, min(1.0, float(waveform_score)))
+    if require_hypothesis and not (hypothesis_text or "").strip():
+        return 0.0, "semantic fail-closed: missing trusted ASR hypothesis"
+
+    if not (hypothesis_text or "").strip():
+        return wave, "waveform only (no hypothesis)"
+
+    semantic = asr_quality(reference_text, hypothesis_text or "")
+    wer = word_error_rate(reference_text, hypothesis_text or "")
+    cer = character_error_rate(reference_text, hypothesis_text or "")
+    w = max(0.0, min(1.0, float(waveform_weight)))
+    fused = max(0.0, min(1.0, w * wave + (1.0 - w) * semantic))
+    note = f"semantic wer={wer:.3f} cer={cer:.3f}; wave={wave:.3f}"
+    return fused, note
 
 
 # --------------------------------------------------------------------------

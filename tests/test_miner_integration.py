@@ -115,7 +115,7 @@ class TestASR:
 
 class TestTTS:
     async def test_synthesis_returns_pcm_with_framing_headers(self, session, miner):
-        payload = {"text": "Violet subnet test.", "speaker_id": "eng_female_1"}
+        payload = {"input": "Violet subnet test.", "voice": "eng_female_1"}
         async with session.post(f"{miner.url}{PATH_TTS_STREAM}", json=payload) as response:
             assert response.status == 200
             # The framing headers must survive the proxy, or the caller cannot
@@ -128,7 +128,7 @@ class TestTTS:
     async def test_first_byte_is_within_target(self, session, miner):
         import time
 
-        payload = {"text": "Latency probe.", "speaker_id": "eng_female_1"}
+        payload = {"input": "Latency probe.", "voice": "eng_female_1"}
         started = time.perf_counter()
         first_byte_ms = None
 
@@ -144,7 +144,7 @@ class TestTTS:
 
     async def test_empty_text_is_rejected(self, session, miner):
         async with session.post(
-            f"{miner.url}{PATH_TTS_STREAM}", json={"text": "  ", "speaker_id": "x"}
+            f"{miner.url}{PATH_TTS_STREAM}", json={"input": "  ", "voice": "x"}
         ) as response:
             assert response.status == 400
 
@@ -167,7 +167,7 @@ class TestTTS:
 
         audio = bytearray()
         async with websockets.connect(url, max_size=None) as ws:
-            await ws.send(json.dumps({"text": "Streaming test.", "speaker_id": "eng_male_1"}))
+            await ws.send(json.dumps({"input": "Streaming test.", "voice": "eng_male_1"}))
             while True:
                 message = await asyncio.wait_for(ws.recv(), timeout=15)
                 if isinstance(message, (bytes, bytearray)):
@@ -175,6 +175,22 @@ class TestTTS:
                 elif json.loads(message).get("type") == "end":
                     break
 
+        assert len(audio) > 512
+
+    async def test_streaming_accepts_legacy_aliases(self, miner):
+        """Legacy {text, speaker_id} is remapped on the WS bridge."""
+        url = miner.url.replace("http://", "ws://") + PATH_TTS_STREAM_WS
+        audio = bytearray()
+        async with websockets.connect(url, max_size=None) as ws:
+            await ws.send(
+                json.dumps({"text": "Legacy streaming.", "speaker_id": "eng_female_1"})
+            )
+            while True:
+                message = await asyncio.wait_for(ws.recv(), timeout=15)
+                if isinstance(message, (bytes, bytearray)):
+                    audio.extend(message)
+                elif json.loads(message).get("type") == "end":
+                    break
         assert len(audio) > 512
 
 

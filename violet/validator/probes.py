@@ -50,7 +50,8 @@ from ..identity import (
     new_nonce,
     verify_hotkey_signature,
 )
-from .metrics import asr_quality, tts_quality, word_error_rate
+from .metrics import asr_quality, tts_quality, tts_semantic_score, word_error_rate
+from .trusted_asr import TrustedAsrConfig, trusted_asr_config_from_env, transcribe_trusted
 
 logger = logging.getLogger("violet.validator.probes")
 
@@ -94,12 +95,16 @@ class MinerProbe:
         *,
         hotkey: str = "",
         access_token: str = "",
+        trusted_asr: Optional[TrustedAsrConfig] = None,
     ):
         self.session = session
         self.endpoint = endpoint.rstrip("/")
         self.hotkey = hotkey
         self._headers = (
             {"Authorization": f"Bearer {access_token}"} if access_token else {}
+        )
+        self.trusted_asr = (
+            trusted_asr if trusted_asr is not None else trusted_asr_config_from_env()
         )
 
     def url(self, path: str) -> str:
@@ -409,12 +414,95 @@ class MinerProbe:
 
     # -- TTS ---------------------------------------------------------------
 
+    async def _score_tts_audio(
+        self,
+        item: TtsItem,
+        audio: bytes,
+        *,
+        kind: str,
+        latency_ms: float,
+        first_byte_ms: Optional[float],
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        sample_width: int = DEFAULT_SAMPLE_WIDTH,
+        channels: int = DEFAULT_CHANNELS,
+        extra_payload: Optional[Dict[str, Any]] = None,
+        progressive_ok: bool = True,
+        progressive_detail: str = "",
+    ) -> ProbeResult:
+        """Waveform sanity plus optional trusted-ASR semantic back-transcription."""
+        wave_score, wave_note = tts_quality(
+            audio,
+            item.text,
+            sample_rate=sample_rate,
+            sample_width=sample_width,
+            channels=channels,
+        )
+        hypothesis: Optional[str] = None
+        asr_detail = "trusted ASR not used"
+        wer: Optional[float] = None
+
+        if self.trusted_asr.enabled:
+            hypothesis, asr_detail = await transcribe_trusted(
+                self.session,
+                self.trusted_asr,
+                audio,
+                language=getattr(item, "language", None) or self.trusted_asr.language,
+                filename=f"{item.id}.wav",
+                sample_rate=sample_rate,
+                sample_width=sample_width,
+                channels=channels,
+            )
+            if hypothesis:
+                wer = word_error_rate(item.text, hypothesis)
+
+        quality, note = tts_semantic_score(
+            item.text,
+            hypothesis,
+            wave_score,
+            require_hypothesis=self.trusted_asr.require_hypothesis,
+        )
+        if not self.trusted_asr.enabled:
+            note = wave_note
+        elif asr_detail != "ok":
+            note = f"{note}; asr={asr_detail}"
+
+        payload: Dict[str, Any] = {
+            "bytes": len(audio),
+            "item_id": item.id,
+            "sample_rate": sample_rate,
+            "semantic": self.trusted_asr.enabled,
+            "asr_detail": asr_detail,
+        }
+        if extra_payload:
+            payload.update(extra_payload)
+
+        ok = quality > 0.0 and progressive_ok
+        detail = note if progressive_ok else (progressive_detail or note)
+        return ProbeResult(
+            ok=ok,
+            kind=kind,
+            latency_ms=latency_ms,
+            first_byte_ms=first_byte_ms,
+            quality=quality,
+            wer=wer,
+            detail=detail,
+            payload=payload,
+        )
+
     async def tts_batch(self, item: TtsItem, timeout_s: float = 30.0) -> ProbeResult:
         """Synthesize a fixed prompt and check the audio matches the text."""
-        payload = {"text": item.text, "speaker_id": item.speaker_id, "temperature": 0.7}
+        # Prefer Spark-native shape; miner remaps legacy aliases if needed.
+        payload = {
+            "input": item.text,
+            "voice": item.speaker_id,
+            "temperature": 0.7,
+        }
         started = time.perf_counter()
         first_byte_ms: Optional[float] = None
         audio = bytearray()
+        sample_rate = DEFAULT_SAMPLE_RATE
+        channels = DEFAULT_CHANNELS
+        width = DEFAULT_SAMPLE_WIDTH
 
         try:
             async with self.session.post(
@@ -458,18 +546,15 @@ class MinerProbe:
                 "tts", f"only {len(audio)} bytes of audio returned", elapsed
             )
 
-        quality, note = tts_quality(
-            bytes(audio), item.text,
-            sample_rate=sample_rate, sample_width=width, channels=channels,
-        )
-        return ProbeResult(
-            ok=quality > 0.0,
+        return await self._score_tts_audio(
+            item,
+            bytes(audio),
             kind="tts",
             latency_ms=elapsed,
             first_byte_ms=first_byte_ms,
-            quality=quality,
-            detail=note,
-            payload={"bytes": len(audio), "item_id": item.id, "sample_rate": sample_rate},
+            sample_rate=sample_rate,
+            sample_width=width,
+            channels=channels,
         )
 
     async def tts_stream(
@@ -488,7 +573,11 @@ class MinerProbe:
             ) as ws:
                 await ws.send(
                     json.dumps(
-                        {"text": item.text, "speaker_id": item.speaker_id, "temperature": 0.7}
+                        {
+                            "input": item.text,
+                            "voice": item.speaker_id,
+                            "temperature": 0.7,
+                        }
                     )
                 )
                 deadline = time.perf_counter() + total_timeout_s
@@ -529,26 +618,16 @@ class MinerProbe:
                 "tts_stream", f"only {len(audio)} bytes streamed", elapsed
             )
 
-        quality, note = tts_quality(bytes(audio), item.text)
         progressive = frame_count >= 2
-        if not progressive:
-            return ProbeResult(
-                ok=False,
-                kind="tts_stream",
-                latency_ms=elapsed,
-                first_byte_ms=first_frame_ms,
-                quality=quality,
-                detail=f"single-frame stream ({frame_count} frames)",
-                payload={"bytes": len(audio), "frames": frame_count, "progressive": False},
-            )
-        return ProbeResult(
-            ok=quality > 0.0,
+        return await self._score_tts_audio(
+            item,
+            bytes(audio),
             kind="tts_stream",
             latency_ms=elapsed,
             first_byte_ms=first_frame_ms,
-            quality=quality,
-            detail=note,
-            payload={"bytes": len(audio), "frames": frame_count, "progressive": True},
+            extra_payload={"frames": frame_count, "progressive": progressive},
+            progressive_ok=progressive,
+            progressive_detail=f"single-frame stream ({frame_count} frames)",
         )
 
     # -- capacity cross-check ---------------------------------------------

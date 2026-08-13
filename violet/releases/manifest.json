@@ -3,7 +3,8 @@
   "notes": [
     "Official Violet inference images. Validators compare miner-declared digests against allowed_digests.",
     "Populate allowed_digests with sha256:... values when images are pinned for a release.",
-    "An empty allowed_digests list disables digest enforcement for that service (bootstrap only)."
+    "Strict mode (default VIOLET_REQUIRE_IMAGE_DIGESTS=1) rejects blank, :latest/mutable tags, and unknown digests.",
+    "Set VIOLET_REQUIRE_IMAGE_DIGESTS=0 only for local bootstrap / CI with mock images."
   ],
   "images": {
     "asr": {

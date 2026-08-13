@@ -1,14 +1,16 @@
-"""Cathedral SN39 external-score ingest client (violet_audio).
+"""Cathedral SN39 external-score ingest client (violet_audio + hybrid).
 
 Cathedral thin validators do **not** accept scores directly. They only fetch a
 signed weight vector from the publisher and call ``set_weights``. Violet /
 cathedral-voice posts score reports here:
 
     POST {publisher}/v1/external-scores/violet
-    source = violet_audio
+    source = violet_audio                 # legacy path (unchanged)
+    source = cathedral_voice_hybrid       # receipt-gated (Brief 3)
     complete = true   # required for blending (incomplete reports are ignored)
 
-See cathedralai/cathedral-validator docs/VIOLET_EXTERNAL_SCORES.md.
+See cathedralai/cathedral-validator docs/VIOLET_EXTERNAL_SCORES.md and
+``docs/CATHEDRAL_VOICE_RECEIPT_v1.md``.
 """
 
 from __future__ import annotations
@@ -25,9 +27,12 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import aiohttp
 
+from .receipt_v1 import verify_receipt
+
 logger = logging.getLogger("violet.cathedral.external_scores")
 
 SOURCE = "violet_audio"
+SOURCE_HYBRID = "cathedral_voice_hybrid"
 SUBMIT_PATH = "/v1/external-scores/violet"
 DEFAULT_PUBLISHER_URL = "https://api.cathedral.computer"
 
@@ -44,6 +49,15 @@ class CathedralScoreClientConfig:
     timeout_s: float = 15.0
     #: When true, still build/post reports but log instead of HTTP POST.
     dry_run: bool = False
+    #: When true, attempt receipt-gated ``cathedral_voice_hybrid`` posts.
+    hybrid_enabled: bool = False
+    #: Prefer hybrid-only (skip violet_audio). Fail closed if no receipts.
+    hybrid_only: bool = False
+    #: HMAC for receipt verify (may differ from publisher body HMAC).
+    receipt_hmac_secret: str = ""
+    #: Ed25519 public key (hex) for receipt verify.
+    receipt_ed25519_public_key_hex: str = ""
+    require_tdx: bool = False
 
 
 def ms_iso(dt: Optional[datetime] = None) -> str:
@@ -141,11 +155,12 @@ def build_violet_report(
     generated_at: Optional[datetime] = None,
     mechanism: str = SOURCE,
     metadata: Optional[Mapping[str, Any]] = None,
+    source: str = SOURCE,
 ) -> Dict[str, Any]:
-    """Build a publisher-ready ``violet_audio`` report.
+    """Build a publisher-ready external score report.
 
-    ``complete=True`` is required for the publisher to *blend* the snapshot.
-    Incomplete reports may store but never enter the signed weight vector.
+    Default ``source`` remains ``violet_audio`` for backward compatibility.
+    Use :func:`build_hybrid_report` for receipt-gated ``cathedral_voice_hybrid``.
     """
     cleaned: List[Dict[str, Any]] = []
     seen: set[str] = set()
@@ -159,14 +174,14 @@ def build_violet_report(
             continue
         seen.add(hotkey)
         entry: Dict[str, Any] = {"miner_hotkey": hotkey, "score": score}
-        for key in ("uid", "quality", "validity", "tasks_scored", "confidence"):
+        for key in ("uid", "quality", "validity", "tasks_scored", "confidence", "receipt"):
             if key in raw and raw[key] is not None:
                 entry[key] = raw[key]
         cleaned.append(entry)
 
     report: Dict[str, Any] = {
-        "source": SOURCE,
-        "mechanism": mechanism or SOURCE,
+        "source": source or SOURCE,
+        "mechanism": mechanism or source or SOURCE,
         "epoch": int(epoch),
         "complete": bool(complete),
         "generated_at": ms_iso(generated_at),
@@ -176,6 +191,91 @@ def build_violet_report(
     if metadata:
         report["metadata"] = dict(metadata)
     return report
+
+
+def build_hybrid_report(
+    scores: Sequence[Mapping[str, Any]],
+    *,
+    epoch: int,
+    netuid: int = 39,
+    complete: bool = True,
+    generated_at: Optional[datetime] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+    hmac_secret: str = "",
+    ed25519_public_key_hex: str = "",
+    require_tdx: bool = False,
+    tdx_policy: Any = None,
+) -> Dict[str, Any]:
+    """Build a ``cathedral_voice_hybrid`` report — fail closed without receipts.
+
+    Each score row must include a ``receipt`` object that passes
+    :func:`verify_receipt`. Does **not** alter C/W/Q weight tables; this only
+    shapes publisher ingest.
+    """
+    if not scores:
+        raise ValueError("hybrid report requires at least one score row")
+
+    cleaned: List[Dict[str, Any]] = []
+    for raw in scores:
+        hotkey = str(raw.get("miner_hotkey") or "").strip()
+        if not hotkey:
+            continue
+        receipt_raw = raw.get("receipt")
+        result = verify_receipt(
+            receipt_raw if isinstance(receipt_raw, Mapping) else None,
+            require=True,
+            hmac_secret=hmac_secret,
+            ed25519_public_key_hex=ed25519_public_key_hex,
+            require_tdx=require_tdx,
+            tdx_policy=tdx_policy,
+        )
+        if not result.ok:
+            raise ValueError(
+                f"hybrid intake rejected {hotkey}: {result.detail}"
+            )
+        if result.receipt and result.receipt.miner_hotkey != hotkey:
+            raise ValueError(
+                f"hybrid intake rejected {hotkey}: receipt hotkey mismatch"
+            )
+        try:
+            score = clamp01(float(raw["score"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"hybrid intake rejected {hotkey}: bad score") from exc
+        entry: Dict[str, Any] = {
+            "miner_hotkey": hotkey,
+            "score": score,
+            "receipt": result.receipt.to_dict() if result.receipt else receipt_raw,
+        }
+        for key in ("uid", "quality", "validity", "tasks_scored", "confidence"):
+            if key in raw and raw[key] is not None:
+                entry[key] = raw[key]
+        cleaned.append(entry)
+
+    if not cleaned:
+        raise ValueError("hybrid report has no valid receipt-gated rows")
+
+    meta = dict(metadata or {})
+    meta["receipt_verified"] = True
+    meta["receipt_schema"] = "cathedral_voice_receipt_v1"
+    meta["execution_class"] = "hybrid_gpu_preview"
+    meta["gpu_attested"] = False
+    meta["gpu_memory_confidential"] = False
+    if any(
+        (isinstance(r.get("receipt"), dict) and r["receipt"].get("controller_measurement"))
+        for r in cleaned
+    ):
+        meta["tdx_controller_measured"] = True
+
+    return build_violet_report(
+        cleaned,
+        epoch=epoch,
+        netuid=netuid,
+        complete=complete,
+        generated_at=generated_at,
+        mechanism=SOURCE_HYBRID,
+        source=SOURCE_HYBRID,
+        metadata=meta,
+    )
 
 
 class CathedralScoreClient:
@@ -300,24 +400,116 @@ class CathedralScoreClient:
         *,
         epoch: Optional[int] = None,
         metadata: Optional[Mapping[str, Any]] = None,
+        receipts_by_hotkey: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """Build a complete violet_audio report from MinerScore rows and POST it."""
-        scores = scores_from_miner_scores(miners)
+        """Build and POST Cathedral score report(s).
+
+        Default path remains ``violet_audio``. When ``hybrid_enabled``, also (or
+        only) posts ``cathedral_voice_hybrid`` — fail closed without verified
+        receipts. Does not alter subnet C/W/Q weight tables.
+        """
+        results: Dict[str, Any] = {"ok": False, "violet_audio": None, "hybrid": None}
+        receipts_by_hotkey = receipts_by_hotkey or {}
+
+        if self.config.hybrid_enabled:
+            hybrid = await self.publish_hybrid_miner_scores(
+                miners,
+                epoch=epoch,
+                metadata=metadata,
+                receipts_by_hotkey=receipts_by_hotkey,
+            )
+            results["hybrid"] = hybrid
+            if self.config.hybrid_only:
+                results["ok"] = bool(hybrid.get("ok"))
+                results["error"] = hybrid.get("error")
+                results["report"] = hybrid.get("report")
+                return results
+
+        if not self.config.hybrid_only:
+            scores = scores_from_miner_scores(miners)
+            ep = self.next_epoch(epoch)
+            report = build_violet_report(
+                scores,
+                epoch=ep,
+                netuid=self.config.netuid,
+                complete=True,
+                metadata=metadata,
+            )
+            violet = await self.post_report(report)
+            violet["report"] = report
+            results["violet_audio"] = violet
+            if violet.get("ok"):
+                logger.info(
+                    "posted violet_audio scores to cathedral: epoch=%s n=%d status=%s",
+                    ep,
+                    len(scores),
+                    violet.get("status"),
+                )
+            results["ok"] = bool(violet.get("ok"))
+            results["error"] = violet.get("error")
+            results["report"] = report
+            results["status"] = violet.get("status")
+            results["body"] = violet.get("body")
+        return results
+
+    async def publish_hybrid_miner_scores(
+        self,
+        miners: Sequence[Any],
+        *,
+        epoch: Optional[int] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+        receipts_by_hotkey: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """POST receipt-gated ``cathedral_voice_hybrid`` scores — fail closed."""
+        receipts_by_hotkey = receipts_by_hotkey or {}
+        base_scores = scores_from_miner_scores(miners)
+        rows: List[Dict[str, Any]] = []
+        for entry in base_scores:
+            hotkey = entry["miner_hotkey"]
+            receipt = receipts_by_hotkey.get(hotkey)
+            if not receipt:
+                continue
+            row = dict(entry)
+            row["receipt"] = receipt
+            rows.append(row)
+
+        if not rows:
+            return {
+                "ok": False,
+                "status": None,
+                "body": None,
+                "error": "hybrid_no_verified_receipts",
+                "idempotent": False,
+            }
+
         ep = self.next_epoch(epoch)
-        report = build_violet_report(
-            scores,
-            epoch=ep,
-            netuid=self.config.netuid,
-            complete=True,
-            metadata=metadata,
-        )
+        try:
+            report = build_hybrid_report(
+                rows,
+                epoch=ep,
+                netuid=self.config.netuid,
+                complete=True,
+                metadata=metadata,
+                hmac_secret=self.config.receipt_hmac_secret or self.config.hmac_secret,
+                ed25519_public_key_hex=self.config.receipt_ed25519_public_key_hex,
+                require_tdx=self.config.require_tdx,
+            )
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "status": None,
+                "body": None,
+                "error": str(exc),
+                "idempotent": False,
+            }
+
         result = await self.post_report(report)
         result["report"] = report
         if result.get("ok"):
             logger.info(
-                "posted violet_audio scores to cathedral: epoch=%s n=%d status=%s",
+                "posted cathedral_voice_hybrid scores: epoch=%s n=%d status=%s",
                 ep,
-                len(scores),
+                len(rows),
                 result.get("status"),
             )
         return result
@@ -358,4 +550,11 @@ def config_from_env() -> CathedralScoreClientConfig:
         netuid=_int("CATHEDRAL_EXTERNAL_SCORES_NETUID", 39),
         timeout_s=_float("CATHEDRAL_EXTERNAL_SCORES_TIMEOUT_S", 15.0),
         dry_run=_bool("CATHEDRAL_EXTERNAL_SCORES_DRY_RUN", False),
+        hybrid_enabled=_bool("CATHEDRAL_HYBRID_SCORES_ENABLED", False),
+        hybrid_only=_bool("CATHEDRAL_HYBRID_ONLY", False),
+        receipt_hmac_secret=os.getenv("CATHEDRAL_RECEIPT_HMAC_SECRET", "").strip(),
+        receipt_ed25519_public_key_hex=os.getenv(
+            "CATHEDRAL_RECEIPT_ED25519_PUBLIC_KEY", ""
+        ).strip(),
+        require_tdx=_bool("CATHEDRAL_HYBRID_REQUIRE_TDX", False),
     )

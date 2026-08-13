@@ -111,10 +111,11 @@ async def voices() -> JSONResponse:
 
 @app.post("/v1/audio/speech/stream")
 async def speech_stream(payload: dict):
-    text = (payload.get("text") or "").strip()
-    speaker_id = payload.get("speaker_id") or "eng_female_1"
+    # Spark-native {input, voice} or legacy {text, speaker_id}.
+    text = (payload.get("input") or payload.get("text") or "").strip()
+    speaker_id = payload.get("voice") or payload.get("speaker_id") or "eng_female_1"
     if not text:
-        return JSONResponse({"error": "'text' is required"}, status_code=400)
+        return JSONResponse({"error": "'input' or 'text' is required"}, status_code=400)
 
     return StreamingResponse(
         _synthesize(text, speaker_id), media_type="audio/pcm", headers=AUDIO_HEADERS
@@ -151,14 +152,18 @@ async def speech_stream_ws(websocket: WebSocket):
                 )
                 continue
 
-            text = (request.get("text") or "").strip()
+            text = (request.get("input") or request.get("text") or "").strip()
             if not text:
                 await websocket.send_text(
-                    json.dumps({"type": "error", "message": "'text' is required"})
+                    json.dumps(
+                        {"type": "error", "message": "'input' or 'text' is required"}
+                    )
                 )
                 continue
 
-            speaker_id = request.get("speaker_id") or "eng_female_1"
+            speaker_id = (
+                request.get("voice") or request.get("speaker_id") or "eng_female_1"
+            )
             await websocket.send_text(
                 json.dumps({"type": "start", **AUDIO_HEADERS})
             )

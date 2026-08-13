@@ -38,7 +38,9 @@ PATH_ASR_TRANSCRIBE = "/transcribe"
 #: Streaming ASR. Binary PCM in (16-bit mono), JSON partial transcripts out.
 PATH_ASR_STREAM_WS = "/realtime/transcribe"
 
-#: Batch/streamed TTS. JSON ``{text, speaker_id, temperature}`` -> raw PCM body.
+#: Batch/streamed TTS. Canonical Spark JSON ``{input, voice, temperature}`` ->
+#: raw PCM body. Miner sidecars also accept legacy ``{text, speaker_id}`` and
+#: remap (see ``docs/TTS_CONTRACT.md``).
 PATH_TTS_STREAM = "/v1/audio/speech/stream"
 #: Voice catalogue.
 PATH_TTS_VOICES = "/v1/voices"
