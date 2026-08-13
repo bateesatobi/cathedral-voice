@@ -89,15 +89,19 @@ prompts in the receipt.
 
 ---
 
-## Publisher checklist (Cathedral ops — out of repo)
+## Publisher checklist (Cathedral ops — `cathedralai/cathedral-validator`)
 
-- [ ] Allow source `cathedral_voice_hybrid` (separate from `violet_audio`)
-- [ ] Require `metadata.receipt_verified == true` or embedded verified receipt
-- [ ] Reject incomplete / unverified hybrid reports for blend
+- [x] Allow source `cathedral_voice_hybrid` (separate from `violet_audio`)
+- [x] Require `metadata.receipt_verified == true` + per-row receipts on positive scores
+- [x] Reject incomplete / unverified hybrid reports for blend
+- [x] Dedicated bearer + mandatory HMAC; explicit `FRACTION`; block `external_primary`
 - [ ] Do **not** alter Violet C/W/Q weights inside subnet code for this path
 - [ ] Keep `violet_audio` ingest unchanged for backward compatibility
+- [ ] Merge/deploy publisher PR and wire production secrets
 
 See also: [CATHEDRAL_EXTERNAL_SCORES.md](./CATHEDRAL_EXTERNAL_SCORES.md),
+[CATHEDRAL_VOICE_PRODUCTION_ENV.md](./CATHEDRAL_VOICE_PRODUCTION_ENV.md),
+[CATHEDRAL_VOICE_PUBLISHER_DEPLOY.md](./CATHEDRAL_VOICE_PUBLISHER_DEPLOY.md),
 [TTS_CONTRACT.md](./TTS_CONTRACT.md),
 [CATHEDRAL_VOICE_PRODUCTION_CHECKLIST.md](./CATHEDRAL_VOICE_PRODUCTION_CHECKLIST.md).
 
@@ -111,6 +115,15 @@ export VIOLET_TTS_RECEIPT_BUFFER=1
 export VIOLET_RECEIPT_ED25519_PRIVATE_KEY=<hex>
 
 python scripts/cathedral_voice_e2e_proof.py
+```
+
+Production cutover (no simulation):
+
+```bash
+python scripts/cathedral_voice_receipt_keygen.py --write-env ./.env.receipt
+python scripts/cathedral_voice_production_preflight.py --role both
+python scripts/cathedral_voice_e2e_proof.py --live \
+  --measurement-file /var/lib/violet/tdx_measurement.json
 ```
 
 Production must use live quotes (`VIOLET_TDX_QUOTE_VERIFIER`) and must **not**

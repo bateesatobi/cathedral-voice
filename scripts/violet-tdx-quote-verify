@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# violet-tdx-quote-verify — DCAP/PCS quote verifier wrapper for Cathedral Voice.
+#
+# Contract (violet.cathedral.tdx):
+#   stdin  = base64-encoded TDX quote (or raw bytes if VIOLET_TDX_QUOTE_RAW=1)
+#   exit 0 = quote accepted
+#   exit != 0 = reject (stderr should explain)
+#
+# Install on miner + validator hosts as VIOLET_TDX_QUOTE_VERIFIER.
+# Replace the inner verifier command with your Intel DCAP / PCS tooling.
+#
+# Example production wiring:
+#   export VIOLET_TDX_QUOTE_VERIFIER=/usr/local/bin/violet-tdx-quote-verify
+#   # and point INNER_VERIFIER below at your DCAP binary.
+
+set -euo pipefail
+
+INNER_VERIFIER="${VIOLET_TDX_DCAP_VERIFIER:-}"
+ALLOW_SIM_CI="${CATHEDRAL_TDX_SIMULATION:-0}"
+
+quote_b64="$(cat)"
+if [[ -z "${quote_b64// }" ]]; then
+  echo "violet-tdx-quote-verify: empty quote on stdin" >&2
+  exit 2
+fi
+
+# Simulated quotes from CI must never pass this wrapper in production.
+if [[ "${quote_b64}" == sim-* ]] || [[ "${quote_b64}" == *simulated* ]]; then
+  if [[ "${ALLOW_SIM_CI}" == "1" || "${ALLOW_SIM_CI}" == "true" ]]; then
+    echo "violet-tdx-quote-verify: accepting simulated quote (CI only)" >&2
+    exit 0
+  fi
+  echo "violet-tdx-quote-verify: simulated quote rejected" >&2
+  exit 3
+fi
+
+if [[ -z "${INNER_VERIFIER}" ]]; then
+  echo "violet-tdx-quote-verify: set VIOLET_TDX_DCAP_VERIFIER to your DCAP/PCS binary" >&2
+  echo "  Example: VIOLET_TDX_DCAP_VERIFIER=/usr/bin/tdx_verify" >&2
+  exit 4
+fi
+
+if [[ ! -x "${INNER_VERIFIER}" ]]; then
+  echo "violet-tdx-quote-verify: INNER_VERIFIER not executable: ${INNER_VERIFIER}" >&2
+  exit 5
+fi
+
+# Prefer piping base64 quote; if your tool wants raw bytes, decode first.
+if [[ "${VIOLET_TDX_QUOTE_RAW:-0}" == "1" ]]; then
+  printf '%s' "${quote_b64}" | base64 -d | "${INNER_VERIFIER}"
+else
+  printf '%s' "${quote_b64}" | "${INNER_VERIFIER}"
+fi

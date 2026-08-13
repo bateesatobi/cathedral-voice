@@ -45,6 +45,10 @@ class CathedralScoreClientConfig:
     publisher_url: str = DEFAULT_PUBLISHER_URL
     token: str = ""
     hmac_secret: str = ""
+    #: Dedicated hybrid ingest credentials (publisher per-source token/HMAC).
+    #: When set, ``cathedral_voice_hybrid`` POSTs use these instead of shared.
+    hybrid_token: str = ""
+    hybrid_hmac_secret: str = ""
     netuid: int = 39
     timeout_s: float = 15.0
     #: When true, still build/post reports but log instead of HTTP POST.
@@ -58,6 +62,15 @@ class CathedralScoreClientConfig:
     #: Ed25519 public key (hex) for receipt verify.
     receipt_ed25519_public_key_hex: str = ""
     require_tdx: bool = False
+
+    def auth_for_source(self, source: str) -> tuple[str, str]:
+        """Return ``(bearer_token, hmac_secret)`` for a report source."""
+        if source == SOURCE_HYBRID and (self.hybrid_token or self.hybrid_hmac_secret):
+            return (
+                (self.hybrid_token or self.token).strip(),
+                (self.hybrid_hmac_secret or self.hmac_secret).strip(),
+            )
+        return self.token.strip(), self.hmac_secret.strip()
 
 
 def ms_iso(dt: Optional[datetime] = None) -> str:
@@ -318,7 +331,9 @@ class CathedralScoreClient:
                 "error": "cathedral_external_scores_disabled",
                 "idempotent": False,
             }
-        if not self.config.token and not self.config.dry_run:
+        source = str(report.get("source") or SOURCE)
+        token, hmac_secret = self.config.auth_for_source(source)
+        if not token and not self.config.dry_run:
             return {
                 "ok": False,
                 "status": None,
@@ -332,12 +347,12 @@ class CathedralScoreClient:
             "Content-Type": "application/json",
             "User-Agent": "cathedral-voice/violet-subnet",
         }
-        if self.config.token:
-            headers["Authorization"] = f"Bearer {self.config.token}"
-            headers["X-Cathedral-External-Token"] = self.config.token
-        if self.config.hmac_secret:
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+            headers["X-Cathedral-External-Token"] = token
+        if hmac_secret:
             headers["X-Cathedral-External-Signature"] = compute_hmac_header(
-                body, self.config.hmac_secret
+                body, hmac_secret
             )
 
         if self.config.dry_run:
@@ -547,6 +562,12 @@ def config_from_env() -> CathedralScoreClientConfig:
         ).rstrip("/"),
         token=os.getenv("CATHEDRAL_EXTERNAL_SCORES_TOKEN", "").strip(),
         hmac_secret=os.getenv("CATHEDRAL_EXTERNAL_SCORES_HMAC_SECRET", "").strip(),
+        hybrid_token=os.getenv(
+            "CATHEDRAL_EXTERNAL_SCORES_TOKEN_CATHEDRAL_VOICE_HYBRID", ""
+        ).strip(),
+        hybrid_hmac_secret=os.getenv(
+            "CATHEDRAL_EXTERNAL_SCORES_HMAC_SECRET_CATHEDRAL_VOICE_HYBRID", ""
+        ).strip(),
         netuid=_int("CATHEDRAL_EXTERNAL_SCORES_NETUID", 39),
         timeout_s=_float("CATHEDRAL_EXTERNAL_SCORES_TIMEOUT_S", 15.0),
         dry_run=_bool("CATHEDRAL_EXTERNAL_SCORES_DRY_RUN", False),

@@ -54,7 +54,11 @@ CATHEDRAL_EXTERNAL_SCORES_DRY_RUN=false
 # CATHEDRAL_HYBRID_SCORES_ENABLED=true
 # CATHEDRAL_HYBRID_ONLY=false          # true = skip violet_audio; fail closed without receipts
 # CATHEDRAL_RECEIPT_HMAC_SECRET=<receipt verify secret>
-# CATHEDRAL_HYBRID_REQUIRE_TDX=false   # true when live TDX quotes are required
+# CATHEDRAL_RECEIPT_ED25519_PUBLIC_KEY=<hex>
+# CATHEDRAL_HYBRID_REQUIRE_TDX=true    # true when live TDX quotes are required
+# Dedicated publisher auth for hybrid (required after cathedral-validator#118):
+# CATHEDRAL_EXTERNAL_SCORES_TOKEN_CATHEDRAL_VOICE_HYBRID=<hybrid_token>
+# CATHEDRAL_EXTERNAL_SCORES_HMAC_SECRET_CATHEDRAL_VOICE_HYBRID=<hybrid_hmac>
 
 # Optional: only feed Cathedral SN39; skip Violet-subnet set_weights
 # CATHEDRAL_SKIP_LOCAL_WEIGHTS=true
