@@ -19,7 +19,7 @@ Central planner: `violet/miner/gpu_env.sh` → `plan_gpu_devices <mode>`.
 | Mode | When | Assignment |
 |------|------|------------|
 | `stt` | `stt_install.sh` alone, or `MINER_SERVICES=asr` | **All** GPUs → STT |
-| `tts` | `tts_install.sh` alone, or `MINER_SERVICES=tts` | **All** GPUs → TTS |
+| `tts` | `tts_install.sh` alone, or `MINER_SERVICES=tts` | Spark TTS via `tts_install.sh` (`spark-tts-frontend`) |
 | `both` | Default `start.sh` / `bootstrap.sh` with `asr,tts` | Partition; **every** GPU in STT ∪ TTS |
 
 **Both-mode partition:**
@@ -44,9 +44,9 @@ Overrides still work via `STT_GPU_DEVICES_OVERRIDE` / `TTS_GPU_DEVICES_OVERRIDE`
 
 ### TTS (`tts_install.sh`)
 
-- `MODEL_POOL_SIZE` defaults to **number of assigned TTS GPUs**.
-- All assigned device IDs are passed via `--gpus` / `NVIDIA_VISIBLE_DEVICES`.
-- Solo / dedicated cards use `GPU_MEMORY_UTILIZATION=0.85`; single-GPU shared with STT uses `0.35`.
+- Container name: `spark-tts-frontend` (image `simonallanachuka/spark-tts-frontend:latest`)
+- Host port default `8002` (`HOST_PORT`); models under `$PWD/models`
+- `start.sh` maps `TTS_PORT` → `HOST_PORT` and optional `TTS_GPU_DEVICES` → `CUDA_VISIBLE_DEVICES`
 
 ### Sidecar admission
 
@@ -100,7 +100,7 @@ Standalone:
 
 ```bash
 ./violet/miner/stt_install.sh   # all GPUs → ASR
-./violet/miner/tts_install.sh   # all GPUs → TTS
+./violet/miner/tts_install.sh   # Spark TTS (spark-tts-frontend)
 ```
 
 ---
@@ -111,7 +111,7 @@ Standalone:
 |------|------|
 | `violet/miner/gpu_env.sh` | Detect, plan, assert no idle, compose device YAML, concurrency, toolkit, disk |
 | `violet/miner/stt_install.sh` | Toolkit, per-GPU speaches + LB, long wait, smoke |
-| `violet/miner/tts_install.sh` | Full-GPU pool, VRAM policy, long wait, smoke |
+| `violet/miner/tts_install.sh` | Spark-TTS frontend deploy (`spark-tts-frontend`, from deploy_vm-2) |
 | `violet/miner/start.sh` | Service-aware plan, concurrency, firewall, smoke, `stop-all` |
 | `violet/miner/bootstrap.sh` | Fail-closed wrapper + wallet/announce hints |
 | `violet/miner/smoke_contract.sh` | Post-boot contract checks |

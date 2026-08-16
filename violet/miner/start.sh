@@ -10,7 +10,7 @@
 #   1. ensure .env + public endpoint (validated; reject paste garbage)
 #   2. plan GPUs from MINER_SERVICES (solo → ALL GPUs; both → full partition)
 #   3. stt_install.sh → etoil-api :9090 (+ speaches + LB when multi-GPU)
-#   4. tts_install.sh → Spark-TTS :8002 (pool = GPU count)
+#   4. tts_install.sh → Spark-TTS :8002 (spark-tts-frontend)
 #   5. auto-tune MINER_MAX_CONCURRENT_* from GPU counts (if unset/0)
 #   6. start miner sidecar → proxies to those upstreams
 #   7. contract smoke (+ optional firewall / announce / public-reachability hints)
@@ -371,11 +371,19 @@ ensure_inference_stacks() {
 
   if services_want_tts; then
     if ! port_health_ok "${TTS_PORT}"; then
-      echo "==> installing / starting TTS (Spark, all TTS GPUs)"
+      echo "==> installing / starting TTS (Spark)"
+      # Tear down legacy container name if present.
+      if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Eq '^cathedral-spark-tts$'; then
+        echo "==> removing legacy TTS container cathedral-spark-tts"
+        docker stop cathedral-spark-tts 2>/dev/null || true
+        docker rm cathedral-spark-tts 2>/dev/null || true
+      fi
       GPU_PLAN_MODE="$plan_mode" GPU_PLAN_LOCKED=1 \
         TTS_HOST_PORT="${TTS_PORT}" \
+        HOST_PORT="${TTS_PORT}" \
         STT_GPU_DEVICES="${STT_GPU_DEVICES}" \
         TTS_GPU_DEVICES="${TTS_GPU_DEVICES}" \
+        CUDA_VISIBLE_DEVICES="${TTS_GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-0}}" \
         "${miner_dir}/tts_install.sh"
     else
       echo "==> TTS already healthy on :${TTS_PORT}"
@@ -697,11 +705,17 @@ stop_all_stacks() {
     echo "==> stopping STT stack"
     docker compose -f "$stt_compose" down --remove-orphans 2>/dev/null || true
   fi
-  local tts_name="${TTS_CONTAINER_NAME:-cathedral-spark-tts}"
+  local tts_name="${TTS_CONTAINER_NAME:-spark-tts-frontend}"
   if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Eq "^${tts_name}\$"; then
     echo "==> stopping TTS ${tts_name}"
     docker stop "$tts_name" 2>/dev/null || true
     docker rm "$tts_name" 2>/dev/null || true
+  fi
+  # Legacy name from previous tts_install.sh
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Eq '^cathedral-spark-tts$'; then
+    echo "==> stopping legacy TTS cathedral-spark-tts"
+    docker stop cathedral-spark-tts 2>/dev/null || true
+    docker rm cathedral-spark-tts 2>/dev/null || true
   fi
   echo "==> miner + inference stacks stopped"
 }

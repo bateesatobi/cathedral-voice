@@ -426,7 +426,7 @@ python scripts/announce_endpoint.py
 | Mode | When | GPUs |
 |------|------|------|
 | Solo ASR | `stt_install.sh` alone | All → STT |
-| Solo TTS | `tts_install.sh` alone | All → TTS |
+| Solo TTS | `tts_install.sh` alone | Spark TTS (`spark-tts-frontend`) |
 | Both | default `start.sh` | Split; no idle card |
 
 Details: [MINER_GPU_BOOTSTRAP_REPORT.md](./MINER_GPU_BOOTSTRAP_REPORT.md)
@@ -451,6 +451,6 @@ Details: [MINER_GPU_BOOTSTRAP_REPORT.md](./MINER_GPU_BOOTSTRAP_REPORT.md)
 | `mount ... ./audio ... no such file or directory` | Old compose used a bind mount; pull latest `stt_install.sh` (uses `stt-audio` volume) |
 | etoil `EXTERNAL_API_URL` / crash-loop on start | Set `EXTERNAL_API_URL=http://speaches:8000` in compose (fixed in latest `stt_install.sh`) |
 | TTS fails / OOM on 1 GPU | Both stacks share GPU 0 — see GPU report; consider ASR-only or TTS-only host |
-| TTS crash-loop / corrupt tokenizer | Set `HF_TOKEN` and re-run `tts_install.sh` (seeds via huggingface_hub) |
+| TTS crash-loop / corrupt tokenizer | Set `HF_TOKEN` and re-run `tts_install.sh` |
 | `btcli` / announce errors | `BT_NETWORK`, wallet path, TAO balance, netuid **39** vs **292** |
 | No emissions | Registered? Announced? GPUs in allowed tier? Passing qualification? |

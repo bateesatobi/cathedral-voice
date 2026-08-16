@@ -24,7 +24,7 @@ services:
       - path: ../.env
         required: false
     environment:
-      # etoil-api (ASR) and Spark-TTS on the host — see stt_install / tts_install
+      # etoil-api (ASR) and Spark-TTS on the host — see stt_install / tts_install.sh
       MINER_ASR_UPSTREAM: ${MINER_ASR_UPSTREAM:-http://host.docker.internal:9090}
       MINER_TTS_UPSTREAM: ${MINER_TTS_UPSTREAM:-http://host.docker.internal:8002}
       MINER_HOST: 0.0.0.0

@@ -82,7 +82,7 @@ See **[MINER_GUIDE.md](docs/MINER_GUIDE.md)** for all 13 steps. Summary:
 4. `btcli` / Bittensor
 5. Create wallet
 6. Configure `.env` (`finney` → 39, `test` → 292)
-7. `./violet/miner/stt_install.sh` + `tts_install.sh`
+7. `./violet/miner/stt_install.sh` + `tts_install.sh` (TTS)
 8. `./violet/miner/bootstrap.sh prod --no-follow`
 9. Local verify + `run_qualification.py`
 10. `btcli subnet register`

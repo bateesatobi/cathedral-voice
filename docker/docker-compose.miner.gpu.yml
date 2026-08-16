@@ -1,5 +1,5 @@
 # GPU visibility for the miner sidecar (nvidia-smi inventory / capacity).
-# ASR/TTS GPUs are assigned by stt_install.sh / tts_install.sh (gpu_env.sh).
+# ASR GPUs are assigned by stt_install.sh (gpu_env.sh). TTS uses tts_install.sh.
 #
 # Wallet mounts belong in docker-compose.miner.prod.yml — keep them out of
 # this overlay so nested Docker (shell in container, daemon on host) does not

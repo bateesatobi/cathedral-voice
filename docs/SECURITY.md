@@ -9,7 +9,7 @@ does not.
 |---|---|---|
 | WebSocket auth | Same bearer token as HTTP (`Authorization` header or `?token=`) | `miner/server.py` |
 | Upload / WS limits | `MINER_MAX_*` env vars; idle timeout on streams | `miner/server.py`, `config.py` |
-| Upstream isolation | ASR/TTS bound to `127.0.0.1` in install scripts | `miner/stt_install.sh`, `miner/tts_install.sh` |
+| Upstream isolation | ASR bound to `127.0.0.1` in STT install; TTS via `tts_install.sh` (`spark-tts-frontend`) | `miner/stt_install.sh`, `miner/tts_install.sh` |
 | HTTPS in prod | `start.sh` rejects `http://` unless `MINER_ALLOW_HTTP=1` | `miner/start.sh` |
 | Endpoint ↔ hotkey binding | Signed `/violet/identity/challenge` | `identity.py`, `validator/probes.py` |
 | Official images | `violet/releases/manifest.json` checked at qualification | `validator/qualification.py` |
