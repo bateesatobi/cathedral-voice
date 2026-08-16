@@ -7,15 +7,6 @@
 
 set -euo pipefail
 
-# Miner start.sh compatibility
-if [[ -z "${HOST_PORT:-}" ]]; then
-  HOST_PORT="${TTS_HOST_PORT:-${TTS_PORT:-}}"
-fi
-[[ -n "${HOST_PORT:-}" ]] && export HOST_PORT
-if [[ -z "${CUDA_VISIBLE_DEVICES:-}" && -n "${TTS_GPU_DEVICES:-}" ]]; then
-  export CUDA_VISIBLE_DEVICES="${TTS_GPU_DEVICES}"
-fi
-
 # Force non-interactive apt-get installs to bypass prompt questions on clean VMs
 export DEBIAN_FRONTEND=noninteractive
 
@@ -71,12 +62,10 @@ fi
 
 # 2. Check for GPU presence
 log_info "Checking for NVIDIA GPU..."
-if command -v lspci >/dev/null 2>&1 && lspci | grep -qi nvidia; then
+if lspci | grep -i nvidia > /dev/null; then
     log_info "NVIDIA GPU detected."
-elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-    log_info "NVIDIA GPU detected via nvidia-smi."
 else
-    log_warn "No NVIDIA GPU detected via lspci/nvidia-smi. If this is a VM/container, GPU may still work via --gpus."
+    log_warn "No NVIDIA GPU detected via lspci. If this is a VM, make sure GPU passthrough is configured."
 fi
 
 # 3. Install Docker if not present
@@ -137,60 +126,21 @@ RUST_LOG="${RUST_LOG:-info}"
 HOST_PORT="${HOST_PORT:-8002}"
 APP_PORT="${APP_PORT:-8002}"
 
-# 6. Models storage
-# Nested Docker (shell in container + host docker.sock): bind-mounting
-# "$PWD/models" fails because Docker resolves paths on the *host*.
-# Use a named volume automatically when /.dockerenv is present.
-log_info "Preparing models storage..."
-MODELS_VOLUME="${TTS_MODELS_VOLUME:-cathedral-tts-models}"
-MODELS_DIR="${TTS_MODELS_DIR:-}"
-USE_NAMED_VOLUME=0
-if [[ -n "${MODELS_DIR}" ]]; then
-    mkdir -p "${MODELS_DIR}/Spark-TTS-0.5B"
-    MODELS_MOUNT="${MODELS_DIR}:/app/models"
-    log_info "Using host bind mount TTS_MODELS_DIR=${MODELS_DIR}"
-elif [[ -f /.dockerenv ]] || [[ "${TTS_USE_NAMED_VOLUME:-}" == "1" ]]; then
-    USE_NAMED_VOLUME=1
-    ${SUDO_CMD} docker volume create "${MODELS_VOLUME}" >/dev/null
-    MODELS_MOUNT="${MODELS_VOLUME}:/app/models"
-    log_warn "Nested Docker detected (or TTS_USE_NAMED_VOLUME=1) — using named volume ${MODELS_VOLUME}"
-else
-    mkdir -p "$PWD/models/Spark-TTS-0.5B"
-    MODELS_MOUNT="$PWD/models:/app/models"
-    log_info "Using local bind mount $PWD/models"
-fi
+# 6. Ensure models directory exists
+log_info "Preparing local models directory..."
+# Resolve the repository root (parent of this script's directory)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+mkdir -p "${REPO_ROOT}/models/Spark-TTS-0.5B"
 
-seed_tokenizer_host() {
-    local dest_dir="$1"
-    mkdir -p "${dest_dir}"
-    if [ -f "${dest_dir}/tokenizer.json" ]; then
-        return 0
-    fi
+# Pre-download tokenizer.json on the host from the specified TOKENIZER_REPO to avoid container curl issues
+if [ ! -f "${REPO_ROOT}/models/Spark-TTS-0.5B/tokenizer.json" ]; then
     log_info "Pre-downloading tokenizer.json from $TOKENIZER_REPO..."
     if [ -n "$HF_TOKEN" ]; then
-        curl -H "Authorization: Bearer $HF_TOKEN" -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o "${dest_dir}/tokenizer.json" || true
+        curl -H "Authorization: Bearer $HF_TOKEN" -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o "${REPO_ROOT}/models/Spark-TTS-0.5B/tokenizer.json" || true
     else
-        curl -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o "${dest_dir}/tokenizer.json" || true
+        curl -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o "${REPO_ROOT}/models/Spark-TTS-0.5B/tokenizer.json" || true
     fi
-}
-
-if [[ "${USE_NAMED_VOLUME}" == "1" ]]; then
-    ${SUDO_CMD} docker run --rm \
-      -v "${MODELS_VOLUME}:/models" \
-      -e HF_TOKEN="$HF_TOKEN" \
-      -e TOKENIZER_REPO="$TOKENIZER_REPO" \
-      curlimages/curl:8.5.0 \
-      sh -c 'mkdir -p /models/Spark-TTS-0.5B; if [ ! -f /models/Spark-TTS-0.5B/tokenizer.json ]; then
-        if [ -n "$HF_TOKEN" ]; then
-          curl -H "Authorization: Bearer $HF_TOKEN" -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o /models/Spark-TTS-0.5B/tokenizer.json || true
-        else
-          curl -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o /models/Spark-TTS-0.5B/tokenizer.json || true
-        fi
-      fi' || log_warn "Tokenizer seed into volume skipped/failed (image will retry)."
-elif [[ -n "${MODELS_DIR}" ]]; then
-    seed_tokenizer_host "${MODELS_DIR}/Spark-TTS-0.5B"
-else
-    seed_tokenizer_host "$PWD/models/Spark-TTS-0.5B"
 fi
 
 # 7. Pull the Spark-TTS Docker image
@@ -201,15 +151,11 @@ ${SUDO_CMD} docker pull "$IMAGE_TAG"
 # 8. Run the Container
 log_info "Starting Spark-TTS container..."
 
+# Remove old container if it exists
 if ${SUDO_CMD} docker ps -a --format '{{.Names}}' | grep -Eq "^spark-tts-frontend$"; then
     log_warn "Existing container 'spark-tts-frontend' found. Stopping and removing..."
     ${SUDO_CMD} docker stop spark-tts-frontend || true
     ${SUDO_CMD} docker rm spark-tts-frontend || true
-fi
-if ${SUDO_CMD} docker ps -a --format '{{.Names}}' | grep -Eq "^cathedral-spark-tts$"; then
-    log_warn "Removing legacy container cathedral-spark-tts..."
-    ${SUDO_CMD} docker stop cathedral-spark-tts || true
-    ${SUDO_CMD} docker rm cathedral-spark-tts || true
 fi
 
 ${SUDO_CMD} docker run -d \
@@ -230,7 +176,7 @@ ${SUDO_CMD} docker run -d \
   -e GPU_MEMORY_UTILIZATION="$GPU_MEMORY_UTILIZATION" \
   -e MODEL_POOL_SIZE="$MODEL_POOL_SIZE" \
   -e SPARK_TTS_DTYPE="$SPARK_TTS_DTYPE" \
-  -v "${MODELS_MOUNT}" \
+  -v "${REPO_ROOT}/models:/app/models" \
   -v hf_cache:/root/.cache/huggingface \
   --shm-size=4gb \
   "$IMAGE_TAG"
@@ -238,4 +184,3 @@ ${SUDO_CMD} docker run -d \
 log_info "Container started successfully! It is running in the background."
 log_info "You can view logs using: ${SUDO_CMD} docker logs -f spark-tts-frontend"
 log_info "Spark-TTS frontend is listening on port ${HOST_PORT} of the VM."
-log_info "Models mount: ${MODELS_MOUNT}"
