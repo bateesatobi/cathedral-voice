@@ -1,28 +1,34 @@
 #!/bin/bash
 # ==============================================================================
-# Spark-TTS VM Deployment Script
-# This script installs Docker, NVIDIA Container Toolkit, pulls the Spark-TTS
-# frontend image, and runs it on a GPU-enabled VM.
+# Spark-TTS VM Deployment Script (miner TTS installer)
+# Installs Docker + NVIDIA Container Toolkit if needed, pulls Spark-TTS, runs it.
+#
+# Models mount:
+#   Default = Docker named volume (works under nested Docker / docker.sock).
+#   Optional host bind: TTS_MODELS_DIR=/absolute/host/path
+#   Optional local bind: TTS_USE_BIND_MOUNT=1 (fails if path only exists in a shell container)
 # ==============================================================================
 
 set -euo pipefail
 
-# Force non-interactive apt-get installs to bypass prompt questions on clean VMs
+# Miner start.sh compatibility
+if [[ -z "${HOST_PORT:-}" ]]; then
+  HOST_PORT="${TTS_HOST_PORT:-${TTS_PORT:-}}"
+fi
+[[ -n "${HOST_PORT:-}" ]] && export HOST_PORT
+if [[ -z "${CUDA_VISIBLE_DEVICES:-}" && -n "${TTS_GPU_DEVICES:-}" ]]; then
+  export CUDA_VISIBLE_DEVICES="${TTS_GPU_DEVICES}"
+fi
+
 export DEBIAN_FRONTEND=noninteractive
 
-# Define Colors for Output
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Validate that this is being run from Linux/WSL, not Git Bash/MinGW.
 if [[ "${OSTYPE:-}" == msys* || "${OSTYPE:-}" == cygwin* || "$(uname -s 2>/dev/null || echo)" == MINGW* || "$(uname -s 2>/dev/null || echo)" == MSYS* ]]; then
     printf '%b\n' "${RED}[ERROR] $(date +'%Y-%m-%d %H:%M:%S')${NC} This deployment script is designed for Linux/WSL Ubuntu, not Git Bash or MinGW."
-    printf '%b\n' "${YELLOW}[INFO] $(date +'%Y-%m-%d %H:%M:%S')${NC} Open WSL2 and run:"
-    echo "  wsl --install -d Ubuntu"
-    echo "  cd /path/to/deploy-tts-rs"
-    echo "  sudo ./deploy_vm.sh"
     exit 1
 fi
 
@@ -30,25 +36,16 @@ if [ "$(id -u 2>/dev/null || echo 0)" -eq 0 ]; then
     SUDO_CMD=""
 else
     if ! command -v sudo >/dev/null 2>&1; then
-        echo -e "${RED}[ERROR] $(date +'%Y-%m-%d %H:%M:%S')${NC} sudo is not available on this machine. Run this script inside WSL2 Ubuntu or as root on Linux."
+        echo -e "${RED}[ERROR] $(date +'%Y-%m-%d %H:%M:%S')${NC} sudo is not available. Run as root or install sudo."
         exit 1
     fi
     SUDO_CMD="sudo"
 fi
 
-log_info() {
-    echo -e "${GREEN}[INFO] $(date +'%Y-%m-%d %H:%M:%S')${NC} $1"
-}
+log_info() { echo -e "${GREEN}[INFO] $(date +'%Y-%m-%d %H:%M:%S')${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN] $(date +'%Y-%m-%d %H:%M:%S')${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR] $(date +'%Y-%m-%d %H:%M:%S')${NC} $1"; }
 
-log_warn() {
-    echo -e "${YELLOW}[WARN] $(date +'%Y-%m-%d %H:%M:%S')${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR] $(date +'%Y-%m-%d %H:%M:%S')${NC} $1"
-}
-
-# 1. Check System Compatibility (Ubuntu/Debian recommended)
 log_info "Verifying system compatibility..."
 if [ -f /etc/os-release ]; then
     . /etc/os-release
@@ -60,49 +57,40 @@ else
     log_warn "Could not detect OS version. Proceeding anyway..."
 fi
 
-# 2. Check for GPU presence
 log_info "Checking for NVIDIA GPU..."
-if lspci | grep -i nvidia > /dev/null; then
-    log_info "NVIDIA GPU detected."
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    log_info "NVIDIA GPU detected via nvidia-smi."
+elif command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -qi nvidia; then
+    log_info "NVIDIA GPU detected via lspci."
 else
-    log_warn "No NVIDIA GPU detected via lspci. If this is a VM, make sure GPU passthrough is configured."
+    log_warn "No GPU via nvidia-smi/lspci (common inside shell containers). Continuing; --gpus all may still work."
 fi
 
-# 3. Install Docker if not present
 if ! command -v docker &> /dev/null; then
     log_info "Docker is not installed. Installing Docker..."
     ${SUDO_CMD} apt-get update
     ${SUDO_CMD} apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" ca-certificates curl gnupg lsb-release
-
     ${SUDO_CMD} mkdir -p /etc/apt/keyrings
     if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg | ${SUDO_CMD} gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     fi
-
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | ${SUDO_CMD} tee /etc/apt/sources.list.d/docker.list > /dev/null
     ${SUDO_CMD} apt-get update
     ${SUDO_CMD} apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-    
-    # Configure docker to run without sudo
     ${SUDO_CMD} usermod -aG docker "$USER" || true
     log_info "Docker successfully installed."
 else
     log_info "Docker is already installed: $(docker --version)"
 fi
 
-# 4. Install NVIDIA Container Toolkit if not present
 if ! command -v nvidia-ctk &> /dev/null; then
     log_info "NVIDIA Container Toolkit is not installed. Setting up repositories and installing..."
-    
-    # Add NVIDIA Container Toolkit repository
     curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | ${SUDO_CMD} gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
     curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
       sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
       ${SUDO_CMD} tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-
     ${SUDO_CMD} apt-get update
     ${SUDO_CMD} apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" nvidia-container-toolkit
-    
     log_info "Configuring NVIDIA Container Toolkit for Docker..."
     ${SUDO_CMD} nvidia-ctk runtime configure --runtime=docker
     ${SUDO_CMD} systemctl restart docker
@@ -111,9 +99,7 @@ else
     log_info "NVIDIA Container Toolkit is already installed: $(nvidia-ctk --version)"
 fi
 
-# 5. Configure environment variables (fully automated)
 log_info "Configuring environment variables..."
-
 HF_TOKEN="${HF_TOKEN:-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}"
 MODEL_NAME="${MODEL_NAME:-phosai/phosai_tts_v1}"
 TOKENIZER_REPO="${TOKENIZER_REPO:-phosai/phosai_tts_v1}"
@@ -126,36 +112,76 @@ RUST_LOG="${RUST_LOG:-info}"
 HOST_PORT="${HOST_PORT:-8002}"
 APP_PORT="${APP_PORT:-8002}"
 
-# 6. Ensure models directory exists
-log_info "Preparing local models directory..."
-# Resolve the repository root (parent of this script's directory)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-mkdir -p "${REPO_ROOT}/models/Spark-TTS-0.5B"
+# violet/miner -> violet-subnet repo root
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+MODELS_VOLUME="${TTS_MODELS_VOLUME:-cathedral-tts-models}"
+MODELS_DIR="${TTS_MODELS_DIR:-}"
 
-# Pre-download tokenizer.json on the host from the specified TOKENIZER_REPO to avoid container curl issues
-if [ ! -f "${REPO_ROOT}/models/Spark-TTS-0.5B/tokenizer.json" ]; then
-    log_info "Pre-downloading tokenizer.json from $TOKENIZER_REPO..."
-    if [ -n "$HF_TOKEN" ]; then
-        curl -H "Authorization: Bearer $HF_TOKEN" -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o "${REPO_ROOT}/models/Spark-TTS-0.5B/tokenizer.json" || true
+log_info "Preparing models storage..."
+# Default: named volume (required when shell is in a container talking to host docker).
+if [[ -n "${MODELS_DIR}" ]]; then
+    mkdir -p "${MODELS_DIR}/Spark-TTS-0.5B"
+    MODELS_MOUNT="${MODELS_DIR}:/app/models"
+    log_info "Using host bind mount TTS_MODELS_DIR=${MODELS_DIR}"
+elif [[ "${TTS_USE_BIND_MOUNT:-0}" == "1" ]]; then
+    mkdir -p "${REPO_ROOT}/models/Spark-TTS-0.5B"
+    MODELS_MOUNT="${REPO_ROOT}/models:/app/models"
+    log_warn "TTS_USE_BIND_MOUNT=1 — bind ${REPO_ROOT}/models (fails under nested Docker if path is not on host)"
+else
+    ${SUDO_CMD} docker volume create "${MODELS_VOLUME}" >/dev/null
+    MODELS_MOUNT="${MODELS_VOLUME}:/app/models"
+    if [[ -f /.dockerenv ]]; then
+        log_warn "Nested Docker (/.dockerenv) — using named volume ${MODELS_VOLUME}"
     else
-        curl -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o "${REPO_ROOT}/models/Spark-TTS-0.5B/tokenizer.json" || true
+        log_info "Using named volume ${MODELS_VOLUME} (set TTS_MODELS_DIR or TTS_USE_BIND_MOUNT=1 to override)"
     fi
 fi
 
-# 7. Pull the Spark-TTS Docker image
+# Seed tokenizer into named volume via a short-lived container; otherwise write on host.
+if [[ "${MODELS_MOUNT}" == *":/app/models" && "${MODELS_MOUNT}" != /* && "${MODELS_MOUNT}" != ./* ]]; then
+    # named volume form: name:/app/models
+    ${SUDO_CMD} docker run --rm \
+      -v "${MODELS_VOLUME}:/models" \
+      -e HF_TOKEN="$HF_TOKEN" \
+      -e TOKENIZER_REPO="$TOKENIZER_REPO" \
+      curlimages/curl:8.5.0 \
+      sh -c 'mkdir -p /models/Spark-TTS-0.5B
+        if [ ! -f /models/Spark-TTS-0.5B/tokenizer.json ]; then
+          if [ -n "$HF_TOKEN" ]; then
+            curl -H "Authorization: Bearer $HF_TOKEN" -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o /models/Spark-TTS-0.5B/tokenizer.json || true
+          else
+            curl -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o /models/Spark-TTS-0.5B/tokenizer.json || true
+          fi
+        fi' || log_warn "Tokenizer seed skipped/failed (image may download later)."
+else
+    # bind mount — seed on the bind source
+    BIND_SRC="${MODELS_MOUNT%%:*}"
+    mkdir -p "${BIND_SRC}/Spark-TTS-0.5B"
+    if [ ! -f "${BIND_SRC}/Spark-TTS-0.5B/tokenizer.json" ]; then
+        log_info "Pre-downloading tokenizer.json from $TOKENIZER_REPO..."
+        if [ -n "$HF_TOKEN" ]; then
+            curl -H "Authorization: Bearer $HF_TOKEN" -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o "${BIND_SRC}/Spark-TTS-0.5B/tokenizer.json" || true
+        else
+            curl -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o "${BIND_SRC}/Spark-TTS-0.5B/tokenizer.json" || true
+        fi
+    fi
+fi
+
 IMAGE_TAG="simonallanachuka/spark-tts-frontend:latest"
 log_info "Pulling Docker image: $IMAGE_TAG..."
 ${SUDO_CMD} docker pull "$IMAGE_TAG"
 
-# 8. Run the Container
 log_info "Starting Spark-TTS container..."
-
-# Remove old container if it exists
 if ${SUDO_CMD} docker ps -a --format '{{.Names}}' | grep -Eq "^spark-tts-frontend$"; then
     log_warn "Existing container 'spark-tts-frontend' found. Stopping and removing..."
     ${SUDO_CMD} docker stop spark-tts-frontend || true
     ${SUDO_CMD} docker rm spark-tts-frontend || true
+fi
+if ${SUDO_CMD} docker ps -a --format '{{.Names}}' | grep -Eq "^cathedral-spark-tts$"; then
+    log_warn "Removing legacy container cathedral-spark-tts..."
+    ${SUDO_CMD} docker stop cathedral-spark-tts || true
+    ${SUDO_CMD} docker rm cathedral-spark-tts || true
 fi
 
 ${SUDO_CMD} docker run -d \
@@ -176,11 +202,12 @@ ${SUDO_CMD} docker run -d \
   -e GPU_MEMORY_UTILIZATION="$GPU_MEMORY_UTILIZATION" \
   -e MODEL_POOL_SIZE="$MODEL_POOL_SIZE" \
   -e SPARK_TTS_DTYPE="$SPARK_TTS_DTYPE" \
-  -v "${REPO_ROOT}/models:/app/models" \
+  -v "${MODELS_MOUNT}" \
   -v hf_cache:/root/.cache/huggingface \
   --shm-size=4gb \
   "$IMAGE_TAG"
 
 log_info "Container started successfully! It is running in the background."
 log_info "You can view logs using: ${SUDO_CMD} docker logs -f spark-tts-frontend"
-log_info "Spark-TTS frontend is listening on port ${HOST_PORT} of the VM."
+log_info "Spark-TTS frontend is listening on port ${HOST_PORT}."
+log_info "Models mount: ${MODELS_MOUNT}"
