@@ -138,36 +138,6 @@ else
     fi
 fi
 
-# Seed tokenizer into named volume via a short-lived container; otherwise write on host.
-if [[ "${MODELS_MOUNT}" == *":/app/models" && "${MODELS_MOUNT}" != /* && "${MODELS_MOUNT}" != ./* ]]; then
-    # named volume form: name:/app/models
-    ${SUDO_CMD} docker run --rm \
-      -v "${MODELS_VOLUME}:/models" \
-      -e HF_TOKEN="$HF_TOKEN" \
-      -e TOKENIZER_REPO="$TOKENIZER_REPO" \
-      curlimages/curl:8.5.0 \
-      sh -c 'mkdir -p /models/Spark-TTS-0.5B
-        if [ ! -f /models/Spark-TTS-0.5B/tokenizer.json ]; then
-          if [ -n "$HF_TOKEN" ]; then
-            curl -H "Authorization: Bearer $HF_TOKEN" -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o /models/Spark-TTS-0.5B/tokenizer.json || true
-          else
-            curl -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o /models/Spark-TTS-0.5B/tokenizer.json || true
-          fi
-        fi' || log_warn "Tokenizer seed skipped/failed (image may download later)."
-else
-    # bind mount — seed on the bind source
-    BIND_SRC="${MODELS_MOUNT%%:*}"
-    mkdir -p "${BIND_SRC}/Spark-TTS-0.5B"
-    if [ ! -f "${BIND_SRC}/Spark-TTS-0.5B/tokenizer.json" ]; then
-        log_info "Pre-downloading tokenizer.json from $TOKENIZER_REPO..."
-        if [ -n "$HF_TOKEN" ]; then
-            curl -H "Authorization: Bearer $HF_TOKEN" -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o "${BIND_SRC}/Spark-TTS-0.5B/tokenizer.json" || true
-        else
-            curl -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o "${BIND_SRC}/Spark-TTS-0.5B/tokenizer.json" || true
-        fi
-    fi
-fi
-
 IMAGE_TAG="simonallanachuka/spark-tts-frontend:latest"
 log_info "Pulling Docker image: $IMAGE_TAG..."
 ${SUDO_CMD} docker pull "$IMAGE_TAG"
