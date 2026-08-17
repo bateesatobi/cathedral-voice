@@ -17,6 +17,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_DIR="${PROJECT_DIR}"
+TTS_PROJECT_DIR="${TTS_PROJECT_DIR:-${SCRIPT_DIR}/tts-stack}"
 # shellcheck source=gpu_env.sh
 source "${SCRIPT_DIR}/gpu_env.sh"
 # shellcheck source=install_lib.sh
@@ -28,7 +29,6 @@ COMPOSE_FILE="${TTS_PROJECT_DIR}/docker-compose.yml"
 
 # start.sh compatibility (optional)
 TTS_HOST_PORT="${TTS_HOST_PORT:-${HOST_PORT:-${TTS_PORT:-8002}}}"
-TTS_PROJECT_DIR="${TTS_PROJECT_DIR:-${SCRIPT_DIR}/tts-stack}"
 CUDA_DEV=""
 DEFAULT_HF_TOKEN="$(default_hf_token)"
 GPU_PLAN_MODE="${GPU_PLAN_MODE:-tts}"
@@ -139,7 +139,7 @@ smoke_test_vllm_cuda_subprocess() {
     log "Checking vLLM-style CUDA subprocess inside a throwaway container..."
     if ! docker run --rm \
         --gpus all \
-        ipc: host \
+        --ipc=host \
         -e NVIDIA_VISIBLE_DEVICES="${CUDA_DEV}" \
         -e CUDA_VISIBLE_DEVICES=0 \
         -e VLLM_USE_V1=0 \
@@ -209,7 +209,7 @@ write_compose_file() {
     local tokenizer_vol="etoil-tts-spark-tokenizer:/app/Spark-TTS-0.5B"
 
     if [[ -f "${PROJECT_DIR}/spark_tts_streaming.py" && "$TTS_INSTALL_PROFILE" == "bare_metal" ]]; then
-        streaming_vol="      - ./spark_tts_streaming.py:/app/spark_tts_streaming.py:ro"
+        streaming_vol="      - ${PROJECT_DIR}/spark_tts_streaming.py:/app/spark_tts_streaming.py:ro"
     elif [[ ! -f "${PROJECT_DIR}/spark_tts_streaming.py" ]]; then
         warn "spark_tts_streaming.py not found — using copy baked into the image."
     fi
