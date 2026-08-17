@@ -1,206 +1,266 @@
-#!/bin/bash
-# ==============================================================================
-# Spark-TTS VM Deployment Script
-# This script installs Docker, NVIDIA Container Toolkit, pulls the Spark-TTS
-# frontend image, and runs it on a GPU-enabled VM.
-# ==============================================================================
-
+#!/usr/bin/env bash
+#
+# install-tts.sh - Self-contained bootstrapper for the etoil-tts stack
+#                   (spark-tts-streaming)
+#
+# This single file installs Docker if needed, writes out docker-compose.yml
+# and .env, then brings the stack up.
+#
+# Usage:
+#   chmod +x install-tts.sh
+#   ./install-tts.sh
+#
 set -euo pipefail
 
-# Miner start.sh compatibility (optional env aliases)
-if [[ -z "${HOST_PORT:-}" ]]; then
-  HOST_PORT="${TTS_HOST_PORT:-${TTS_PORT:-}}"
-fi
-[[ -n "${HOST_PORT:-}" ]] && export HOST_PORT
-if [[ -z "${CUDA_VISIBLE_DEVICES:-}" && -n "${TTS_GPU_DEVICES:-}" ]]; then
-  export CUDA_VISIBLE_DEVICES="${TTS_GPU_DEVICES}"
-fi
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="${PROJECT_DIR}"
+# shellcheck source=gpu_env.sh
+source "${SCRIPT_DIR}/gpu_env.sh"
+# shellcheck source=install_lib.sh
+INSTALL_LOG_PREFIX="tts_install"
+source "${SCRIPT_DIR}/install_lib.sh"
 
-# Force non-interactive apt-get installs to bypass prompt questions on clean VMs
-export DEBIAN_FRONTEND=noninteractive
+ENV_FILE="${PROJECT_DIR}/.env"
+COMPOSE_FILE="${PROJECT_DIR}/docker-compose.yml"
 
-# Define Colors for Output
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m' # No Color
+# start.sh compatibility (optional)
+TTS_HOST_PORT="${TTS_HOST_PORT:-${HOST_PORT:-${TTS_PORT:-8002}}}"
+CUDA_DEV=""
+DEFAULT_HF_TOKEN="$(default_hf_token)"
 
-# Validate that this is being run from Linux/WSL, not Git Bash/MinGW.
-if [[ "${OSTYPE:-}" == msys* || "${OSTYPE:-}" == cygwin* || "$(uname -s 2>/dev/null || echo)" == MINGW* || "$(uname -s 2>/dev/null || echo)" == MSYS* ]]; then
-    printf '%b\n' "${RED}[ERROR] $(date +'%Y-%m-%d %H:%M:%S')${NC} This deployment script is designed for Linux/WSL Ubuntu, not Git Bash or MinGW."
-    printf '%b\n' "${YELLOW}[INFO] $(date +'%Y-%m-%d %H:%M:%S')${NC} Open WSL2 and run:"
-    echo "  wsl --install -d Ubuntu"
-    echo "  cd /path/to/deploy-tts-rs"
-    echo "  sudo ./deploy_vm.sh"
-    exit 1
-fi
+log()  { echo -e "\033[1;32m[install]\033[0m $*"; }
+warn() { echo -e "\033[1;33m[warn]\033[0m $*"; }
+err()  { echo -e "\033[1;31m[error]\033[0m $*" >&2; }
 
-if [ "$(id -u 2>/dev/null || echo 0)" -eq 0 ]; then
-    SUDO_CMD=""
-else
-    if ! command -v sudo >/dev/null 2>&1; then
-        echo -e "${RED}[ERROR] $(date +'%Y-%m-%d %H:%M:%S')${NC} sudo is not available on this machine. Run this script inside WSL2 Ubuntu or as root on Linux."
-        exit 1
-    fi
-    SUDO_CMD="sudo"
-fi
-
-log_info() {
-    echo -e "${GREEN}[INFO] $(date +'%Y-%m-%d %H:%M:%S')${NC} $1"
-}
-
-log_warn() {
-    echo -e "${YELLOW}[WARN] $(date +'%Y-%m-%d %H:%M:%S')${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR] $(date +'%Y-%m-%d %H:%M:%S')${NC} $1"
-}
-
-# 1. Check System Compatibility (Ubuntu/Debian recommended)
-log_info "Verifying system compatibility..."
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    log_info "Detected OS: $NAME $VERSION"
-    if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
-        log_warn "This script is optimized for Ubuntu/Debian. It may fail or require manual steps on other distributions."
-    fi
-else
-    log_warn "Could not detect OS version. Proceeding anyway..."
-fi
-
-# 2. Check for GPU presence
-log_info "Checking for NVIDIA GPU..."
-if command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -qi nvidia; then
-    log_info "NVIDIA GPU detected."
-else
-    log_warn "No NVIDIA GPU detected via lspci. If this is a VM, make sure GPU passthrough is configured."
-fi
-
-# 3. Install Docker if not present
-if ! command -v docker &> /dev/null; then
-    log_info "Docker is not installed. Installing Docker..."
-    ${SUDO_CMD} apt-get update
-    ${SUDO_CMD} apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" ca-certificates curl gnupg lsb-release
-
-    ${SUDO_CMD} mkdir -p /etc/apt/keyrings
-    if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | ${SUDO_CMD} gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    fi
-
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | ${SUDO_CMD} tee /etc/apt/sources.list.d/docker.list > /dev/null
-    ${SUDO_CMD} apt-get update
-    ${SUDO_CMD} apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-    
-    # Configure docker to run without sudo
-    ${SUDO_CMD} usermod -aG docker "$USER" || true
-    log_info "Docker successfully installed."
-else
-    log_info "Docker is already installed: $(docker --version)"
-fi
-
-# 4. Install NVIDIA Container Toolkit if not present
-if ! command -v nvidia-ctk &> /dev/null; then
-    log_info "NVIDIA Container Toolkit is not installed. Setting up repositories and installing..."
-    
-    # Add NVIDIA Container Toolkit repository
-    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | ${SUDO_CMD} gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-      sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-      ${SUDO_CMD} tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-
-    ${SUDO_CMD} apt-get update
-    ${SUDO_CMD} apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" nvidia-container-toolkit
-    
-    log_info "Configuring NVIDIA Container Toolkit for Docker..."
-    ${SUDO_CMD} nvidia-ctk runtime configure --runtime=docker
-    ${SUDO_CMD} systemctl restart docker
-    log_info "NVIDIA Container Toolkit successfully installed and configured."
-else
-    log_info "NVIDIA Container Toolkit is already installed: $(nvidia-ctk --version)"
-fi
-
-# 5. Configure environment variables (fully automated)
-log_info "Configuring environment variables..."
-
-HF_TOKEN="${HF_TOKEN:-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}"
-MODEL_NAME="${MODEL_NAME:-phosai/phosai_tts_v1}"
-TOKENIZER_REPO="${TOKENIZER_REPO:-phosai/phosai_tts_v1}"
-MODEL_POOL_SIZE="${MODEL_POOL_SIZE:-1}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.5}"
-SPARK_TTS_DTYPE="${SPARK_TTS_DTYPE:-f32}"
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-VLLM_BACKEND_URL="${VLLM_BACKEND_URL:-http://localhost:8000}"
-RUST_LOG="${RUST_LOG:-info}"
-HOST_PORT="${HOST_PORT:-8002}"
-APP_PORT="${APP_PORT:-8002}"
-
-# 6. Ensure models directory exists
-log_info "Preparing local models directory..."
-# Resolve the repository root (parent of this script's directory)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-mkdir -p "${REPO_ROOT}/models/Spark-TTS-0.5B"
-
-# Pre-download tokenizer.json on the host from the specified TOKENIZER_REPO to avoid container curl issues
-if [ ! -f "${REPO_ROOT}/models/Spark-TTS-0.5B/tokenizer.json" ]; then
-    log_info "Pre-downloading tokenizer.json from $TOKENIZER_REPO..."
-    if [ -n "$HF_TOKEN" ]; then
-        curl -H "Authorization: Bearer $HF_TOKEN" -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o "${REPO_ROOT}/models/Spark-TTS-0.5B/tokenizer.json" || true
+require_root_or_sudo() {
+    if [[ $EUID -ne 0 ]]; then
+        SUDO="sudo"
     else
-        curl -L -sS "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" -o "${REPO_ROOT}/models/Spark-TTS-0.5B/tokenizer.json" || true
+        SUDO=""
     fi
-fi
+}
 
-# Nested Docker (shell in container + host docker.sock): bind-mounting REPO_ROOT/models
-# fails because Docker resolves the path on the *host*. Use a named volume instead.
-MODELS_MOUNT="${REPO_ROOT}/models:/app/models"
-if [[ -f /.dockerenv ]] || [[ "${TTS_USE_NAMED_VOLUME:-}" == "1" ]]; then
-    MODELS_VOLUME="${TTS_MODELS_VOLUME:-spark-tts-models}"
-    ${SUDO_CMD} docker volume create "${MODELS_VOLUME}" >/dev/null
-    MODELS_MOUNT="${MODELS_VOLUME}:/app/models"
-    log_warn "Using Docker named volume ${MODELS_VOLUME} (avoids nested-Docker bind mount failure)"
-fi
+nested_docker() {
+    [[ -f /.dockerenv ]]
+}
 
-# 7. Pull the Spark-TTS Docker image
-IMAGE_TAG="simonallanachuka/spark-tts-frontend:latest"
-log_info "Pulling Docker image: $IMAGE_TAG..."
-${SUDO_CMD} docker pull "$IMAGE_TAG"
+first_gpu_id() {
+    local devices="$1"
+    echo "${devices%%,*}" | tr -d '[:space:]'
+}
 
-# 8. Run the Container
-log_info "Starting Spark-TTS container..."
+gpu_index_valid() {
+    local idx="$1" count="$2"
+    [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 0 && idx < count ))
+}
 
-# Remove old container if it exists
-if ${SUDO_CMD} docker ps -a --format '{{.Names}}' | grep -Eq "^spark-tts-frontend$"; then
-    log_warn "Existing container 'spark-tts-frontend' found. Stopping and removing..."
-    ${SUDO_CMD} docker stop spark-tts-frontend || true
-    ${SUDO_CMD} docker rm spark-tts-frontend || true
-fi
+resolve_cuda_dev() {
+    local requested n
+    requested="${TTS_GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-}}"
 
-${SUDO_CMD} docker run -d \
-  --name spark-tts-frontend \
-  --restart unless-stopped \
-  --gpus all \
-  -p "${HOST_PORT}:${APP_PORT}" \
-  -e HF_TOKEN="$HF_TOKEN" \
-  -e MODEL_NAME="$MODEL_NAME" \
-  -e TOKENIZER_REPO="$TOKENIZER_REPO" \
-  -e CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
-  -e NVIDIA_VISIBLE_DEVICES="all" \
-  -e NVIDIA_DRIVER_CAPABILITIES="compute,utility" \
-  -e VLLM_BACKEND_URL="$VLLM_BACKEND_URL" \
-  -e MODEL_DIR="/app/models/Spark-TTS-0.5B" \
-  -e PORT="${APP_PORT}" \
-  -e RUST_LOG="$RUST_LOG" \
-  -e GPU_MEMORY_UTILIZATION="$GPU_MEMORY_UTILIZATION" \
-  -e MODEL_POOL_SIZE="$MODEL_POOL_SIZE" \
-  -e SPARK_TTS_DTYPE="$SPARK_TTS_DTYPE" \
-  -v "${MODELS_MOUNT}" \
-  -v hf_cache:/root/.cache/huggingface \
-  --shm-size=4gb \
-  "$IMAGE_TAG"
+    if [[ -z "$requested" ]]; then
+        n="$(detect_gpu_count)"
+        if nested_docker || (( n < 3 )); then
+            requested="0"
+        else
+            requested="2"
+        fi
+    fi
 
-log_info "Container started successfully! It is running in the background."
-log_info "You can view logs using: ${SUDO_CMD} docker logs -f spark-tts-frontend"
-log_info "Spark-TTS frontend is listening on port ${HOST_PORT} of the VM."
-log_info "Models mount: ${MODELS_MOUNT}"
+    CUDA_DEV="$(first_gpu_id "$requested")"
+    n="$(detect_gpu_count)"
+
+    if (( n > 0 )); then
+        if ! gpu_index_valid "$CUDA_DEV" "$n"; then
+            warn "GPU ${CUDA_DEV} not found (detected ${n} GPU(s)); using GPU 0"
+            CUDA_DEV="0"
+        fi
+    elif nested_docker; then
+        warn "nvidia-smi unavailable in this shell; defaulting TTS to host GPU 0"
+        CUDA_DEV="0"
+    fi
+
+    log "TTS host GPU index: ${CUDA_DEV} (TTS_GPU_DEVICES=${TTS_GPU_DEVICES:-<unset>})"
+    export CUDA_DEV
+}
+
+# ---------------------------------------------------------------------------
+# 1. Install Docker Engine + Compose plugin (if missing)
+# ---------------------------------------------------------------------------
+install_docker() {
+    if command -v docker &>/dev/null; then
+        log "Docker already installed: $(docker --version)"
+    else
+        log "Installing Docker Engine..."
+        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+        $SUDO sh /tmp/get-docker.sh
+        rm -f /tmp/get-docker.sh
+        $SUDO usermod -aG docker "$USER" || true
+        warn "Added $USER to the docker group. Log out/in (or run 'newgrp docker') for it to take effect."
+    fi
+
+    if ! docker compose version &>/dev/null; then
+        err "docker compose plugin not found even after Docker install. Check your Docker installation."
+        exit 1
+    else
+        log "docker compose plugin OK: $(docker compose version)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 2. Check NVIDIA Container Toolkit (assumed already installed on this host)
+# ---------------------------------------------------------------------------
+check_nvidia_toolkit() {
+    if ! command -v nvidia-smi &>/dev/null; then
+        warn "nvidia-smi not found on this machine. etoil-tts requests GPUs and will fail to start without a working NVIDIA driver + toolkit."
+        return
+    fi
+    log "nvidia-smi found:"
+    nvidia-smi -L || true
+
+    if docker info 2>/dev/null | grep -qi "nvidia"; then
+        log "NVIDIA Container Toolkit already configured with Docker."
+    else
+        warn "NVIDIA Container Toolkit does not appear to be configured with Docker (nvidia runtime not found in 'docker info'). etoil-tts may fail to start."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 3. Write docker-compose.yml (secrets pulled from .env, never hardcoded)
+# ---------------------------------------------------------------------------
+write_compose_file() {
+    local cache_vol="./cache:/app/cache"
+    local tokenizer_vol="./Spark-TTS-0.5B:/app/Spark-TTS-0.5B"
+    local streaming_vol=""
+    local named_volumes_block=""
+
+    if nested_docker; then
+        cache_vol="etoil-tts-cache:/app/cache"
+        tokenizer_vol="etoil-tts-spark-tokenizer:/app/Spark-TTS-0.5B"
+        named_volumes_block="
+volumes:
+  etoil-tts-cache:
+  etoil-tts-spark-tokenizer:"
+        warn "Nested Docker detected — using named volumes etoil-tts-cache and etoil-tts-spark-tokenizer instead of bind mounts"
+        warn "Nested Docker: skipping spark_tts_streaming.py bind mount (using image default)"
+    elif [[ -f "${PROJECT_DIR}/spark_tts_streaming.py" ]]; then
+        streaming_vol="      - ./spark_tts_streaming.py:/app/spark_tts_streaming.py:ro"
+    fi
+
+    log "Writing ${COMPOSE_FILE}"
+    local gpu_devices_yaml
+    gpu_devices_yaml="$(gpu_compose_device_ids_yaml "$CUDA_DEV")"
+    cat > "$COMPOSE_FILE" <<EOF
+services:
+  etoil-tts:
+    image: simonallanachuka/spark-tts-streaming:v1.5
+    container_name: etoil-tts
+    ports:
+      - '${TTS_HOST_PORT}:8002'
+    environment:
+      - PYTHONPATH=/app
+      - CUDA_VISIBLE_DEVICES=${CUDA_DEV}
+      - GPU_MEMORY_UTILIZATION=0.65
+      - MODEL_NAME=phosai/phosai_tts_v1
+      - TOKENIZER_REPO=unsloth/Spark-TTS-0.5B
+      - TOKENIZER_CACHE_DIR=Spark-TTS-0.5B
+      - SPARK_TTS_REPO_PATH=Spark-TTS
+      - HF_TOKEN=\${HF_TOKEN}
+      - NCCL_DEBUG=WARN
+      - NCCL_SOCKET_IFNAME=lo
+      - NCCL_IB_DISABLE=1
+      - NCCL_P2P_DISABLE=1
+      - NCCL_NET_GDR_LEVEL=0
+      - NCCL_SHM_DISABLE=1
+      - NCCL_TREE_THRESHOLD=0
+      - NCCL_RING_THRESHOLD=8388608
+    volumes:
+      - ${cache_vol}
+      - ${tokenizer_vol}
+${streaming_vol}
+    shm_size: '2gb'
+    deploy:
+      resources:
+        reservations:
+          devices:
+${gpu_devices_yaml}
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:8002/']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s${named_volumes_block}
+EOF
+    log "docker-compose.yml written."
+}
+
+# ---------------------------------------------------------------------------
+# 4. Write .env (HF token for compose variable substitution)
+# ---------------------------------------------------------------------------
+setup_env_file() {
+    log "Writing ${ENV_FILE}"
+    printf 'HF_TOKEN=%s\n' "${HF_TOKEN:-$DEFAULT_HF_TOKEN}" > "$ENV_FILE"
+
+    chmod 600 "$ENV_FILE"
+    log ".env written and locked to 600 permissions."
+
+    if ! grep -qxF ".env" "${PROJECT_DIR}/.gitignore" 2>/dev/null; then
+        echo ".env" >> "${PROJECT_DIR}/.gitignore"
+        log "Added .env to .gitignore"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 5. Misc setup
+# ---------------------------------------------------------------------------
+setup_dirs() {
+    mkdir -p "${PROJECT_DIR}/cache"
+    mkdir -p "${PROJECT_DIR}/Spark-TTS-0.5B"
+    log "Ensured ./cache and ./Spark-TTS-0.5B directories exist."
+
+    if [[ ! -f "${PROJECT_DIR}/spark_tts_streaming.py" ]]; then
+        if nested_docker; then
+            warn "spark_tts_streaming.py not found locally; nested Docker will use the copy baked into the image."
+        else
+            warn "spark_tts_streaming.py not found in ${PROJECT_DIR}. It's mounted read-only into the container — the service will fail to start without it."
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 6. Bring the stack up
+# ---------------------------------------------------------------------------
+start_stack() {
+    log "Pulling images..."
+    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull
+
+    log "Starting stack..."
+    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d
+
+    log "Stack started. Current status:"
+    docker compose -f "$COMPOSE_FILE" ps
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+    require_root_or_sudo
+    install_docker
+    check_nvidia_toolkit
+    resolve_cuda_dev
+    write_compose_file
+    setup_env_file
+    setup_dirs
+    start_stack
+
+    log "Done. Useful commands:"
+    echo "    docker compose -f ${COMPOSE_FILE} logs -f etoil-tts"
+    echo "    docker compose -f ${COMPOSE_FILE} down"
+}
+
+main "$@"

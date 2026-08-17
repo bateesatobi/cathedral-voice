@@ -10,7 +10,7 @@
 #   1. ensure .env + public endpoint (validated; reject paste garbage)
 #   2. plan GPUs from MINER_SERVICES (solo → ALL GPUs; both → full partition)
 #   3. stt_install.sh → etoil-api :9090 (+ speaches + LB when multi-GPU)
-#   4. tts_install.sh → Spark-TTS :8002 (spark-tts-frontend)
+#   4. tts_install.sh → Spark-TTS :8002 (etoil-tts)
 #   5. auto-tune MINER_MAX_CONCURRENT_* from GPU counts (if unset/0)
 #   6. start miner sidecar → proxies to those upstreams
 #   7. contract smoke (+ optional firewall / announce / public-reachability hints)
@@ -705,13 +705,23 @@ stop_all_stacks() {
     echo "==> stopping STT stack"
     docker compose -f "$stt_compose" down --remove-orphans 2>/dev/null || true
   fi
-  local tts_name="${TTS_CONTAINER_NAME:-spark-tts-frontend}"
+  local tts_compose="${ROOT}/violet/miner/docker-compose.yml"
+  if [[ -f "$tts_compose" ]]; then
+    echo "==> stopping TTS compose stack"
+    docker compose -f "$tts_compose" down --remove-orphans 2>/dev/null || true
+  fi
+  local tts_name="${TTS_CONTAINER_NAME:-etoil-tts}"
   if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Eq "^${tts_name}\$"; then
     echo "==> stopping TTS ${tts_name}"
     docker stop "$tts_name" 2>/dev/null || true
     docker rm "$tts_name" 2>/dev/null || true
   fi
-  # Legacy name from previous tts_install.sh
+  # Legacy names from previous tts_install.sh
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Eq '^spark-tts-frontend$'; then
+    echo "==> stopping legacy TTS spark-tts-frontend"
+    docker stop spark-tts-frontend 2>/dev/null || true
+    docker rm spark-tts-frontend 2>/dev/null || true
+  fi
   if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Eq '^cathedral-spark-tts$'; then
     echo "==> stopping legacy TTS cathedral-spark-tts"
     docker stop cathedral-spark-tts 2>/dev/null || true
