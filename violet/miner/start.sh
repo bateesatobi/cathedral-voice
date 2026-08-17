@@ -705,7 +705,7 @@ stop_all_stacks() {
     echo "==> stopping STT stack"
     docker compose -f "$stt_compose" down --remove-orphans 2>/dev/null || true
   fi
-  local tts_compose="${ROOT}/violet/miner/docker-compose.yml"
+  local tts_compose="${ROOT}/violet/miner/tts-stack/docker-compose.yml"
   if [[ -f "$tts_compose" ]]; then
     echo "==> stopping TTS compose stack"
     docker compose -f "$tts_compose" down --remove-orphans 2>/dev/null || true
