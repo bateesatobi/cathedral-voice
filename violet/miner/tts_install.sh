@@ -202,7 +202,12 @@ check_nvidia_toolkit() {
 # ---------------------------------------------------------------------------
 # 3. Write docker-compose.yml (secrets pulled from .env, never hardcoded)
 # ---------------------------------------------------------------------------
+ensure_tts_project_dir() {
+    mkdir -p "${TTS_PROJECT_DIR}"
+}
+
 write_compose_file() {
+    ensure_tts_project_dir
     local streaming_vol=""
     # Always named volumes (same idea as STT hf-hub-cache) — safe on bare metal and DinD.
     local cache_vol="etoil-tts-cache:/app/cache"
@@ -312,7 +317,7 @@ EOF
 # 5. Misc setup
 # ---------------------------------------------------------------------------
 setup_dirs() {
-    mkdir -p "${TTS_PROJECT_DIR}"
+    ensure_tts_project_dir
     log "TTS stack directory: ${TTS_PROJECT_DIR}"
 }
 
