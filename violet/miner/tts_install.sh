@@ -83,8 +83,23 @@ resolve_cuda_dev() {
         CUDA_DEV="0"
     fi
 
-    log "TTS host GPU index: ${CUDA_DEV} (TTS_GPU_DEVICES=${TTS_GPU_DEVICES:-<unset>})"
-    export CUDA_DEV
+    # Inside a single-GPU container, CUDA always sees device 0 (see stt_install.sh).
+    CONTAINER_CUDA="0"
+
+    log "TTS host GPU index: ${CUDA_DEV} (container CUDA_VISIBLE_DEVICES=${CONTAINER_CUDA})"
+    export CUDA_DEV CONTAINER_CUDA
+}
+
+smoke_test_docker_gpu() {
+    log "Checking Docker GPU access..."
+    if ! docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi -L >/dev/null 2>&1; then
+        err "Docker cannot access GPUs (docker run --gpus all nvidia-smi failed)."
+        if nested_docker; then
+            err "Nested Docker: run tts_install.sh on the bare-metal GPU host, not inside a GPU dev container."
+        fi
+        exit 1
+    fi
+    log "Docker GPU smoke test OK."
 }
 
 # ---------------------------------------------------------------------------
@@ -151,8 +166,18 @@ volumes:
     fi
 
     log "Writing ${COMPOSE_FILE}"
-    local gpu_devices_yaml
+    local gpu_devices_yaml gpu_block
     gpu_devices_yaml="$(gpu_compose_device_ids_yaml "$CUDA_DEV")"
+    if nested_docker; then
+        gpu_block="    gpus: all"
+        warn "Nested Docker: using gpus:all + ipc:host (dev container may still block GPU — prefer bare-metal host)"
+    else
+        gpu_block="    deploy:
+      resources:
+        reservations:
+          devices:
+${gpu_devices_yaml}"
+    fi
     cat > "$COMPOSE_FILE" <<EOF
 services:
   etoil-tts:
@@ -160,10 +185,14 @@ services:
     container_name: etoil-tts
     ports:
       - '${TTS_HOST_PORT}:8002'
+    ipc: host
     environment:
       - PYTHONPATH=/app
-      - CUDA_VISIBLE_DEVICES=${CUDA_DEV}
+      - NVIDIA_VISIBLE_DEVICES=${CUDA_DEV}
+      - CUDA_VISIBLE_DEVICES=${CONTAINER_CUDA}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - GPU_MEMORY_UTILIZATION=0.65
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
       - MODEL_NAME=phosai/phosai_tts_v1
       - TOKENIZER_REPO=unsloth/Spark-TTS-0.5B
       - TOKENIZER_CACHE_DIR=Spark-TTS-0.5B
@@ -181,19 +210,15 @@ services:
       - ${cache_vol}
       - ${tokenizer_vol}
 ${streaming_vol}
-    shm_size: '2gb'
-    deploy:
-      resources:
-        reservations:
-          devices:
-${gpu_devices_yaml}
+    shm_size: '8gb'
+${gpu_block}
     restart: unless-stopped
     healthcheck:
       test: ['CMD', 'curl', '-f', 'http://localhost:8002/']
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s${named_volumes_block}
+      start_period: 120s${named_volumes_block}
 EOF
     log "docker-compose.yml written."
 }
@@ -201,9 +226,26 @@ EOF
 # ---------------------------------------------------------------------------
 # 4. Write .env (HF token for compose variable substitution)
 # ---------------------------------------------------------------------------
+sanitize_hf_token() {
+    local raw="${1:-}"
+    # Strip whitespace and any non-ASCII chars (smart quotes, em-dashes, etc.).
+    printf '%s' "$raw" | tr -d '[:space:]' | LC_ALL=C tr -cd '[:print:]'
+}
+
 setup_env_file() {
+    local token
+    token="$(sanitize_hf_token "${HF_TOKEN:-$DEFAULT_HF_TOKEN}")"
+
+    if [[ -z "$token" ]]; then
+        err "HF_TOKEN is empty. Export HF_TOKEN=hf_... or add it to ${ENV_FILE} before running."
+        exit 1
+    fi
+    if [[ "$token" != hf_* ]]; then
+        warn "HF_TOKEN does not start with hf_ — Hugging Face downloads may fail."
+    fi
+
     log "Writing ${ENV_FILE}"
-    printf 'HF_TOKEN=%s\n' "${HF_TOKEN:-$DEFAULT_HF_TOKEN}" > "$ENV_FILE"
+    printf 'HF_TOKEN=%s\n' "$token" > "$ENV_FILE"
 
     chmod 600 "$ENV_FILE"
     log ".env written and locked to 600 permissions."
@@ -234,7 +276,31 @@ setup_dirs() {
 # ---------------------------------------------------------------------------
 # 6. Bring the stack up
 # ---------------------------------------------------------------------------
+stop_existing_stack() {
+    local name="${TTS_CONTAINER_NAME:-etoil-tts}"
+
+    if [[ -f "$COMPOSE_FILE" ]]; then
+        log "Stopping any existing TTS compose stack..."
+        docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
+    fi
+
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Fxq "$name"; then
+        warn "Removing leftover container '${name}'..."
+        docker rm -f "$name" 2>/dev/null || true
+    fi
+
+    for legacy in spark-tts-frontend cathedral-spark-tts; do
+        if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Fxq "$legacy"; then
+            warn "Removing legacy TTS container '${legacy}'..."
+            docker rm -f "$legacy" 2>/dev/null || true
+        fi
+    done
+}
+
 start_stack() {
+    stop_existing_stack
+    smoke_test_docker_gpu
+
     log "Pulling images..."
     docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull
 
