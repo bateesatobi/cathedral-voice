@@ -166,17 +166,10 @@ volumes:
     fi
 
     log "Writing ${COMPOSE_FILE}"
-    local gpu_devices_yaml gpu_block
+    local gpu_devices_yaml
     gpu_devices_yaml="$(gpu_compose_device_ids_yaml "$CUDA_DEV")"
     if nested_docker; then
-        gpu_block="    gpus: all"
-        warn "Nested Docker: using gpus:all + ipc:host (dev container may still block GPU — prefer bare-metal host)"
-    else
-        gpu_block="    deploy:
-      resources:
-        reservations:
-          devices:
-${gpu_devices_yaml}"
+        warn "Nested Docker: using deploy GPU reservations + ipc:host (prefer bare-metal host if CUDA init fails)"
     fi
     cat > "$COMPOSE_FILE" <<EOF
 services:
@@ -211,7 +204,11 @@ services:
       - ${tokenizer_vol}
 ${streaming_vol}
     shm_size: '8gb'
-${gpu_block}
+    deploy:
+      resources:
+        reservations:
+          devices:
+${gpu_devices_yaml}
     restart: unless-stopped
     healthcheck:
       test: ['CMD', 'curl', '-f', 'http://localhost:8002/']
