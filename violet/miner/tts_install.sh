@@ -10,6 +10,9 @@
 # Usage:
 #   ./violet/miner/tts_install.sh
 #   GPU_PLAN_MODE=both TTS_GPU_DEVICES=2 ./violet/miner/tts_install.sh
+#   TTS_FORCE_CPU=1 ./violet/miner/tts_install.sh          # skip GPU entirely
+#   TTS_AUTO_FORCE_CPU=1 ./violet/miner/tts_install.sh    # CPU if preflight probe fails
+#   TTS_CUDA_PROBE=0 ./violet/miner/tts_install.sh        # skip container CUDA probe
 # ==============================================================================
 
 set -euo pipefail
@@ -104,8 +107,186 @@ gpu_ids_for_compose() {
     echo "${out[*]}"
 }
 
+# Host-side GPU snapshot (runs outside spark-tts container).
+log_gpu_host_snapshot() {
+    if ! command -v nvidia-smi &>/dev/null; then
+        log_warn "nvidia-smi unavailable — skipping host GPU snapshot."
+        return 0
+    fi
+    log_info "Host GPU snapshot (outside TTS container):"
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && log_info "  ${line}"
+    done < <(nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu \
+        --format=csv,noheader 2>/dev/null || true)
+    local procs
+    procs="$(nvidia-smi --query-compute-apps=gpu_bus_id,pid,process_name,used_memory \
+        --format=csv,noheader 2>/dev/null || true)"
+    if [[ -n "$procs" ]]; then
+        log_info "GPU compute processes on host:"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && log_info "  ${line}"
+        done <<<"$procs"
+    else
+        log_info "No GPU compute processes visible on host."
+    fi
+}
+
+# Probe CUDA the same way TTS will: docker run + GPU reservation + PyTorch dual alloc.
+# Prints: ok | skipped_cpu_mode | no_cuda | dual_fail | probe_error
+probe_cuda_dual_alloc_in_container() {
+    local devices="$1"
+    local image="$2"
+    local compose_ids cuda_inside gpu_flag out rc=0
+
+    if [[ -z "$devices" ]]; then
+        echo "skipped_cpu_mode"
+        return 0
+    fi
+    if ! command -v docker &>/dev/null; then
+        echo "probe_error"
+        log_warn "docker unavailable — skipping CUDA container probe." >&2
+        return 1
+    fi
+
+    compose_ids="$(gpu_ids_for_compose "$devices")"
+    [[ -z "$compose_ids" ]] && compose_ids="$devices"
+    cuda_inside="$(container_cuda_devices "$devices")"
+    gpu_flag="device=${compose_ids}"
+
+    log_info "CUDA probe: docker run --gpus ${gpu_flag} (CUDA_VISIBLE_DEVICES=${cuda_inside})" >&2
+
+    set +e
+    out="$(${SUDO_CMD} docker run --rm \
+        --gpus "$gpu_flag" \
+        -e "CUDA_VISIBLE_DEVICES=${cuda_inside}" \
+        -e "NVIDIA_VISIBLE_DEVICES=${devices}" \
+        -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+        --entrypoint /opt/nvidia/nvidia_entrypoint.sh \
+        "$image" \
+        python3 -c "
+import sys
+try:
+    import torch
+except Exception as exc:
+    print('PROBE_ERROR import:', exc)
+    sys.exit(3)
+if not torch.cuda.is_available():
+    print('PROBE_NO_CUDA')
+    sys.exit(2)
+try:
+    torch.cuda.init()
+    n = torch.cuda.device_count()
+    name = torch.cuda.get_device_name(0) if n else 'none'
+    print(f'PROBE_CUDA devices={n} name={name}')
+    a = torch.nn.Linear(4096, 4096).cuda()
+    x = torch.randn(8, 4096, device='cuda')
+    _ = a(x)
+    torch.cuda.synchronize()
+    b = torch.nn.Linear(2048, 2048).cuda()
+    _ = b(x[:, :2048])
+    torch.cuda.synchronize()
+    print('PROBE_OK dual_cuda')
+except Exception as exc:
+    print('PROBE_FAIL dual_cuda:', exc)
+    sys.exit(1)
+" 2>&1)"
+    rc=$?
+    set -e
+
+    if echo "$out" | grep -q 'PROBE_OK dual_cuda'; then
+        echo "ok"
+        log_info "CUDA probe passed: second GPU allocation succeeded (BiCodec-style load)." >&2
+        return 0
+    fi
+    if echo "$out" | grep -q 'PROBE_NO_CUDA'; then
+        echo "no_cuda"
+        log_warn "CUDA probe: PyTorch sees no CUDA inside a GPU-reserved container." >&2
+        echo "$out" | grep -E 'PROBE_|CUDA' | head -5 | while read -r line; do log_warn "  ${line}" >&2; done
+        return 1
+    fi
+    if echo "$out" | grep -q 'PROBE_FAIL'; then
+        echo "dual_fail"
+        log_warn "CUDA probe: second CUDA allocation failed (same pattern as BiCodec DevicesUnavailable)." >&2
+        echo "$out" | grep -E 'PROBE_|CUDA|busy|unavailable' | head -8 | while read -r line; do log_warn "  ${line}" >&2; done
+        return 1
+    fi
+    echo "probe_error"
+    log_warn "CUDA probe inconclusive (docker exit ${rc})." >&2
+    echo "$out" | tail -8 | while read -r line; do log_warn "  ${line}" >&2; done
+    return 1
+}
+
+# Optional nvidia-smi inside a minimal CUDA image (driver/runtime wiring only).
+probe_nvidia_smi_in_container() {
+    local devices="$1"
+    local compose_ids gpu_flag out
+
+    if [[ -z "$devices" ]] || ! command -v docker &>/dev/null; then
+        return 0
+    fi
+    compose_ids="$(gpu_ids_for_compose "$devices")"
+    [[ -z "$compose_ids" ]] && compose_ids="$devices"
+    gpu_flag="device=${compose_ids}"
+
+    set +e
+    out="$(${SUDO_CMD} docker run --rm --gpus "$gpu_flag" \
+        nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi -L 2>&1)"
+    set -e
+    if echo "$out" | grep -qi 'GPU'; then
+        log_info "nvidia-smi inside probe container: OK" >&2
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && log_info "  ${line}" >&2
+        done <<<"$out"
+        return 0
+    fi
+    log_warn "nvidia-smi inside probe container failed:" >&2
+    echo "$out" | tail -5 | while read -r line; do log_warn "  ${line}" >&2; done
+    return 1
+}
+
+apply_cuda_preflight() {
+    local probe_result="${1:-probe_error}"
+
+    case "$probe_result" in
+        ok|skipped_cpu_mode)
+            return 0
+            ;;
+        dual_fail)
+            if nested_docker; then
+                log_warn "Nested Docker detected: text model may load on GPU; BiCodec often falls back to CPU."
+                log_warn "If logs show 'keeping on CPU', startup can still succeed — wait for port ${HOST_PORT}."
+            fi
+            if [[ "${TTS_AUTO_FORCE_CPU:-}" == "1" ]]; then
+                log_warn "TTS_AUTO_FORCE_CPU=1 — reconfiguring compose for CPU-only TTS."
+                TTS_GPU_DEVICES=""
+                CUDA_VISIBLE_DEVICES=""
+                export TTS_GPU_DEVICES CUDA_VISIBLE_DEVICES
+                write_compose_file ""
+                return 0
+            fi
+            log_warn "Continuing with GPU text + CPU BiCodec fallback (default). Set TTS_FORCE_CPU=1 for all-CPU."
+            ;;
+        no_cuda)
+            log_warn "Container GPU passthrough looks broken. Check NVIDIA Container Toolkit and driver."
+            if [[ "${TTS_AUTO_FORCE_CPU:-}" == "1" ]]; then
+                log_warn "TTS_AUTO_FORCE_CPU=1 — falling back to CPU-only TTS."
+                TTS_GPU_DEVICES=""
+                CUDA_VISIBLE_DEVICES=""
+                export TTS_GPU_DEVICES CUDA_VISIBLE_DEVICES
+                write_compose_file ""
+            fi
+            ;;
+        probe_error)
+            log_warn "CUDA preflight inconclusive — continuing with planned GPU settings."
+            ;;
+    esac
+    return 0
+}
+
 # Spark BiCodec .to(cuda) often raises DevicesUnavailable in DinD after the text
-# model loads. Retry, then keep that module on CPU so the API can still start.
+# model loads (second CUDA allocation). Retry, then fall back to CPU for that module.
+# Injected via exec() before the app starts — sitecustomize.py is unreliable here
+# (nvidia_entrypoint may use a different python prefix than the patch path).
 cuda_to_retry_patch() {
     cat <<'PY'
 import time
@@ -117,50 +298,59 @@ try:
 except Exception:
     raise SystemExit(0)
 
-_orig_to = Module.to
+print("[tts_install] CUDA retry/CPU-fallback patch active", flush=True)
 
-def _to_with_retry(self, *args, **kwargs):
-    last = None
+def _cuda_busy(exc):
+    msg = str(exc).lower()
+    return "busy or unavailable" in msg or "devicesunavailable" in msg
+
+def _to_cpu_args(args, kwargs):
+    new_args = list(args)
+    for i, a in enumerate(new_args):
+        if a == "cuda" or a == "cuda:0":
+            new_args[i] = "cpu"
+        elif isinstance(a, torch.device) and a.type == "cuda":
+            new_args[i] = torch.device("cpu")
+    kwargs = dict(kwargs)
+    dev = kwargs.get("device")
+    if dev == "cuda" or dev == "cuda:0":
+        kwargs["device"] = "cpu"
+    elif isinstance(dev, str) and dev.startswith("cuda"):
+        kwargs["device"] = "cpu"
+    elif isinstance(dev, torch.device) and dev.type == "cuda":
+        kwargs["device"] = torch.device("cpu")
+    return tuple(new_args), kwargs
+
+def _to_with_retry(orig_to, self, *args, **kwargs):
     for attempt in range(6):
         try:
-            return _orig_to(self, *args, **kwargs)
+            return orig_to(self, *args, **kwargs)
         except Exception as exc:
-            msg = str(exc).lower()
-            if "busy or unavailable" not in msg and "devicesunavailable" not in msg:
+            if not _cuda_busy(exc):
                 raise
-            last = exc
             try:
                 torch.cuda.empty_cache()
             except Exception:
                 pass
             time.sleep(0.4 * (attempt + 1))
     warnings.warn(
-        "CUDA device busy/unavailable after retries; moving this module to CPU. "
-        "TTS will still serve, possibly slower.",
+        "CUDA busy/unavailable after retries; using CPU for this tensor/module. "
+        "Common in nested Docker when the host GPU is already in use.",
         RuntimeWarning,
         stacklevel=2,
     )
-    new_args = []
-    for a in args:
-        if a == "cuda" or a == "cuda:0":
-            new_args.append("cpu")
-        else:
-            new_args.append(a)
-    kwargs = dict(kwargs)
-    dev = kwargs.get("device")
-    if dev == "cuda" or (isinstance(dev, str) and str(dev).startswith("cuda")):
-        kwargs["device"] = "cpu"
-    try:
-        import torch as _t
-        if "device" in kwargs and isinstance(kwargs["device"], _t.device) and kwargs["device"].type == "cuda":
-            kwargs["device"] = _t.device("cpu")
-        elif args and isinstance(args[0], _t.device) and args[0].type == "cuda":
-            new_args[0] = _t.device("cpu")
-    except Exception:
-        pass
-    return _orig_to(self, *tuple(new_args), **kwargs)
+    cpu_args, cpu_kwargs = _to_cpu_args(args, kwargs)
+    return orig_to(self, *cpu_args, **cpu_kwargs)
 
-Module.to = _to_with_retry
+_orig_module_to = Module.to
+def _module_to_patched(self, *args, **kwargs):
+    return _to_with_retry(_orig_module_to, self, *args, **kwargs)
+Module.to = _module_to_patched
+
+_orig_tensor_to = torch.Tensor.to
+def _tensor_to_patched(self, *args, **kwargs):
+    return _to_with_retry(_orig_tensor_to, self, *args, **kwargs)
+torch.Tensor.to = _tensor_to_patched
 PY
 }
 
@@ -168,12 +358,24 @@ PY
 # Named volumes only. No ipc:host / no CUDA worker spawn.
 write_compose_file() {
     local devices="$1"
-    local compose_ids cuda_inside device_yaml patch_b64
+    local compose_ids cuda_inside device_yaml patch_b64 nvidia_visible gpu_block=""
     compose_ids="$(gpu_ids_for_compose "$devices")"
     [[ -z "$compose_ids" ]] && compose_ids="$devices"
-    device_yaml="$(gpu_compose_device_ids_yaml "$compose_ids")"
     cuda_inside="$(container_cuda_devices "$devices")"
+    nvidia_visible="${devices}"
     patch_b64="$(cuda_to_retry_patch | base64 | tr -d '\n')"
+    if [[ -n "$devices" ]]; then
+        device_yaml="$(gpu_compose_device_ids_yaml "$compose_ids")"
+        gpu_block="    deploy:
+      resources:
+        reservations:
+          devices:
+${device_yaml}"
+    else
+        cuda_inside=""
+        nvidia_visible=""
+        log_warn "No GPU reservation in compose (CPU-only mode)."
+    fi
     mkdir -p "${TTS_PROJECT_DIR}"
     cat > "${COMPOSE_FILE}" <<EOF
 # Generated by tts_install.sh — do not edit by hand.
@@ -191,21 +393,21 @@ services:
       HOST: "0.0.0.0"
       PORT: "${APP_PORT}"
       CUDA_VISIBLE_DEVICES: "${cuda_inside}"
+      NVIDIA_VISIBLE_DEVICES: "${nvidia_visible}"
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       TTS_CUDA_PATCH_B64: "${patch_b64}"
     volumes:
       - hf-cache:/root/.cache/huggingface
     shm_size: "2gb"
-    deploy:
-      resources:
-        reservations:
-          devices:
-${device_yaml}
+${gpu_block}
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
-        python3 -c "import os,base64,pathlib; p=pathlib.Path('/usr/local/lib/python3.10/dist-packages/sitecustomize.py'); p.write_bytes(base64.b64decode(os.environ['TTS_CUDA_PATCH_B64']))"
-        exec /opt/nvidia/nvidia_entrypoint.sh python3 /app/spark_tts_streaming.py
+        exec /opt/nvidia/nvidia_entrypoint.sh python3 -c "
+        import os, base64, runpy
+        exec(base64.b64decode(os.environ['TTS_CUDA_PATCH_B64']))
+        runpy.run_path('/app/spark_tts_streaming.py', run_name='__main__')
+        "
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${APP_PORT}/"]
       interval: 30s
@@ -216,7 +418,7 @@ ${device_yaml}
 volumes:
   hf-cache:
 EOF
-    log_info "Compose GPU ids: ${compose_ids} (CUDA inside container: ${cuda_inside})"
+    log_info "Compose GPU ids: ${compose_ids:-none} (CUDA inside container: ${cuda_inside:-cpu})"
 }
 
 # ------------------------------------------------------------------------------
@@ -242,9 +444,13 @@ else
     log_warn "No NVIDIA GPU detected via nvidia-smi or lspci. Ensure GPU passthrough is enabled."
 fi
 
+# DinD warning (see write_compose_file / patch for mitigations).
 if nested_docker; then
     warn_nested_docker "TTS_ALLOW_NESTED_DOCKER"
     log_info "Nested Docker: launching TTS the same way as STT (compose GPU reservation, named volume, no ipc:host)."
+    log_warn "Remote spaces share one GPU between your shell container and spark-tts-streaming."
+    log_warn "TTS loads two CUDA models (text + BiCodec); the second often fails with DevicesUnavailable."
+    log_warn "If startup still fails: stop STT/other GPU jobs first, or run with TTS_FORCE_CPU=1."
 fi
 
 # ------------------------------------------------------------------------------
@@ -315,14 +521,23 @@ MODEL_NAME="${MODEL_NAME:-phosai/phosai_tts_v1}"
 GPU_PLAN_MODE="${GPU_PLAN_MODE:-tts}"
 
 # Dynamic GPU assignment (solo TTS → all cards; both → TTS partition).
-plan_gpu_devices "${GPU_PLAN_MODE}"
-if [[ -z "${TTS_GPU_DEVICES:-}" ]]; then
-    log_warn "No TTS GPU partition from plan (count=$(detect_gpu_count)). Falling back to GPU 0 / --gpus all."
-    TTS_GPU_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+if [[ -n "${TTS_FORCE_CPU:-}" ]]; then
+    log_warn "TTS_FORCE_CPU=1 — running spark-tts without GPU (CPU-only fallback)."
+    TTS_GPU_DEVICES=""
+else
+    plan_gpu_devices "${GPU_PLAN_MODE}"
+    if [[ -z "${TTS_GPU_DEVICES:-}" ]]; then
+        log_warn "No TTS GPU partition from plan (count=$(detect_gpu_count)). Falling back to GPU 0 / --gpus all."
+        TTS_GPU_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+    fi
 fi
 export TTS_GPU_DEVICES
 
-CUDA_VISIBLE_DEVICES="$(container_cuda_devices "${TTS_GPU_DEVICES}")"
+if [[ -n "${TTS_GPU_DEVICES:-}" ]]; then
+    CUDA_VISIBLE_DEVICES="$(container_cuda_devices "${TTS_GPU_DEVICES}")"
+else
+    CUDA_VISIBLE_DEVICES=""
+fi
 
 log_info "Image:              ${IMAGE_TAG}"
 log_info "Container Name:     ${CONTAINER_NAME}"
@@ -334,11 +549,31 @@ log_info "CUDA inside ctr:    ${CUDA_VISIBLE_DEVICES}"
 log_info "Compose file:       ${COMPOSE_FILE}"
 
 # ------------------------------------------------------------------------------
-# 5. Write compose (STT-equivalent GPU wiring) & pull
+# 5. Pull image, CUDA preflight (outside container), write compose
 # ------------------------------------------------------------------------------
-log_step "Step 5: Writing compose and pulling ${IMAGE_TAG}"
+log_step "Step 5: Pulling ${IMAGE_TAG}"
+${SUDO_CMD} docker pull "${IMAGE_TAG}"
+
+log_step "Step 5b: CUDA preflight (host + container probes)"
+log_gpu_host_snapshot
+TTS_CUDA_PROBE="${TTS_CUDA_PROBE:-1}"
+if [[ -n "${TTS_FORCE_CPU:-}" ]]; then
+    log_info "TTS_FORCE_CPU=1 — skipping CUDA container probes."
+    PROBE_RESULT="skipped_cpu_mode"
+elif [[ "$TTS_CUDA_PROBE" != "1" ]]; then
+    log_info "TTS_CUDA_PROBE=0 — skipping CUDA container probes."
+    PROBE_RESULT="skipped_cpu_mode"
+elif ! command -v nvidia-smi &>/dev/null; then
+    log_warn "No nvidia-smi on host — skipping CUDA container probes."
+    PROBE_RESULT="skipped_cpu_mode"
+else
+    probe_nvidia_smi_in_container "${TTS_GPU_DEVICES}" || true
+    PROBE_RESULT="$(probe_cuda_dual_alloc_in_container "${TTS_GPU_DEVICES}" "${IMAGE_TAG}" || true)"
+fi
+apply_cuda_preflight "${PROBE_RESULT}"
+
+log_step "Step 5c: Writing compose"
 write_compose_file "${TTS_GPU_DEVICES}"
-${SUDO_CMD} docker compose -f "${COMPOSE_FILE}" pull
 
 # ------------------------------------------------------------------------------
 # 6. Stop and Remove Previous Container

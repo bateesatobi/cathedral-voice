@@ -219,14 +219,16 @@ btcli wallet list
 
 ### 6. Configure `.env`
 
+Create the file:
+
 ```bash
 cp .env.example .env
 ```
 
-**Testnet example:**
+Set at least these keys before you run anything:
 
 ```bash
-BT_NETWORK=test
+BT_NETWORK=test                 # or finney
 BT_WALLET_NAME=my-coldkey
 BT_WALLET_HOTKEY=my-miner
 
@@ -234,40 +236,99 @@ MINER_SERVICES=asr,tts
 MINER_PORT=8091
 ASR_PORT=9090
 TTS_PORT=8002
+
+# The sidecar proxies to these local services
 MINER_ASR_UPSTREAM=http://host.docker.internal:9090
 MINER_TTS_UPSTREAM=http://host.docker.internal:8002
-# Set after step 9, or let start.sh prompt:
-# MINER_PUBLIC_ENDPOINT=http://YOUR_PUBLIC_IP:8091
 
-# Hugging Face token for model pulls (stt_install / tts_install).
-# Prefer your own token; rotate if a shared default was ever committed.
-# HF_TOKEN=hf_...
+# Set this to the REAL public URL that validators should dial.
+# Must match the public port you expose on the host/router.
+MINER_PUBLIC_ENDPOINT=http://YOUR_PUBLIC_IP:8091
+
+# Required for private / gated Hugging Face pulls used by STT/TTS.
+# Use plain ASCII only: hf_... (no smart quotes, no em-dashes, no trailing comments)
+HF_TOKEN=hf_...
 ```
 
-**Mainnet example:** same as above, but:
+Mainnet uses:
 
 ```bash
 BT_NETWORK=finney
-# netuid 39 is chosen automatically
 ```
 
-Edit with your wallet names and (later) your public endpoint.
+Notes:
+
+- `MINER_PORT` is the miner sidecar listen port, and `start.sh` now uses it as-is when it is set.
+- `MINER_PUBLIC_ENDPOINT` is what gets announced on chain.
+- If you change the public port, change **both** `MINER_PORT` and `MINER_PUBLIC_ENDPOINT`.
+- Keep `ASR_PORT` and `TTS_PORT` private unless you intentionally publish them.
 
 ---
 
-### 7. Install GPU inference (ASR + TTS)
+### 7. Set the miner public port
 
-These scripts use **every GPU** on the host (split when both ASR and TTS run together).
+Before you start the miner, choose the public port validators should dial.
+
+Example using port `40202`:
 
 ```bash
-# ASR: speaches + etoil-api → :9090
+sed -i '/^MINER_PORT=/d;/^MINER_PUBLIC_ENDPOINT=/d' .env
+cat >> .env <<'EOF'
+MINER_PORT=40202
+MINER_PUBLIC_ENDPOINT=http://YOUR_PUBLIC_IP:40202
+EOF
+```
+
+Verify:
+
+```bash
+grep -E '^(MINER_PORT|MINER_PUBLIC_ENDPOINT)=' .env
+```
+
+If you use `prod` with plain HTTP instead of HTTPS, also set:
+
+```bash
+echo 'MINER_ALLOW_HTTP=1' >> .env
+```
+
+Then open that same port publicly in your firewall / router port-forward.
+
+---
+
+### 8. Install GPU inference (ASR + TTS)
+
+Run from the repo root:
+
+```bash
+cd ~/cathedral-voice
+source .venv/bin/activate
+
+# Make HF_TOKEN visible to the install scripts as well as .env
+export HF_TOKEN="$(grep '^HF_TOKEN=' .env | cut -d= -f2-)"
+
+# ASR: speaches + etoil-api -> :9090
 ./violet/miner/stt_install.sh
 
-# TTS: Spark-TTS → :8002
+# TTS: Spark-TTS -> :8002
 ./violet/miner/tts_install.sh
 ```
 
-Or let the next step install them automatically if ports are down.
+What success looks like:
+
+- STT: `Contract smoke: POST /transcribe -> 200`
+- TTS: service answers on `http://127.0.0.1:8002/` or the stream endpoint
+
+If you want the sidecar to install them automatically, skip this step and use `bootstrap.sh` in step 9.
+
+Known issues we hit in practice:
+
+- If `stt_install.sh` shows Hugging Face / `UnicodeEncodeError` failures, your `HF_TOKEN` is missing or malformed. Re-check `.env` and re-export `HF_TOKEN`.
+- On a single GPU in nested Docker, TTS may load the text model on GPU and keep BiCodec on CPU. That is acceptable if the service still becomes healthy.
+- If TTS cannot start reliably on the GPU, try:
+
+```bash
+TTS_FORCE_CPU=1 ./violet/miner/tts_install.sh
+```
 
 Optional TTS stream smoke test:
 
@@ -277,28 +338,31 @@ TTS_URL=http://127.0.0.1:8002 python violet/miner/tts_test_stream.py
 
 ---
 
-### 8. Start the miner (sidecar + inference)
+### 9. Start the miner (sidecar + inference)
 
-**Recommended** (firewall hint + contract smoke + announce hints):
-
-```bash
-./violet/miner/bootstrap.sh prod --no-follow
-```
-
-**Or** directly:
+Recommended: start everything with the checklist wrapper.
 
 ```bash
-./violet/miner/start.sh prod --gpu --no-follow
+MINER_SERVICES=asr,tts ./violet/miner/bootstrap.sh prod --gpu --no-follow
 ```
 
-When prompted, enter your **public IP or DNS**. Port **8091** is appended automatically.
+If STT/TTS are already running and healthy, start only the sidecar:
+
+```bash
+MINER_SERVICES=asr,tts SKIP_INFERENCE_INSTALL=1 ./violet/miner/start.sh prod --gpu --no-follow
+```
+
+When prompted, enter your public IP or DNS.
+
+- If you enter only a host, `start.sh` appends `MINER_PORT`.
+- If your public port is not `8091`, set `MINER_PORT` and `MINER_PUBLIC_ENDPOINT` first in `.env`.
 
 The sidecar proxies:
 
 - ASR → etoil-api (`MINER_ASR_UPSTREAM`, default `:9090`)
 - TTS → Spark (`MINER_TTS_UPSTREAM`, default `:8002`)
 
-**Open TCP 8091** in your cloud security group / firewall so validators can reach you.  
+Open `MINER_PORT` publicly in your cloud security group / firewall so validators can reach you.  
 On home/office routers (Keenetic, etc.), add an explicit port-forward — see [Network / NAT](#network--nat-keenetic-and-similar-routers) above.
 
 `bootstrap.sh` ends with an **admission checklist** (local smoke, wallet, public-port hint, announce dry-run). Optional qualification:
@@ -309,10 +373,10 @@ BOOTSTRAP_QUALIFY=1 ./violet/miner/bootstrap.sh prod --gpu --no-follow
 
 ---
 
-### 9. Verify locally (before spending TAO on chain)
+### 10. Verify locally (before spending TAO on chain)
 
 ```bash
-# Full validator-facing contract on :8091 (+ local upstreams)
+# Full validator-facing contract on the public miner port (+ local upstreams)
 ./violet/miner/smoke_contract.sh
 
 # Spark often 404s on /health — speech stream is the TTS readiness check
@@ -321,12 +385,12 @@ curl -sS -o /dev/null -w '%{http_code}\n' -H 'Content-Type: application/json' \
   -d '{"text":"hi","speaker_id":"eng_female_1","temperature":0.7}' \
   http://127.0.0.1:8002/v1/audio/speech/stream
 
-curl -fsS http://127.0.0.1:8091/health | python3 -m json.tool | head -40
-curl -fsS http://127.0.0.1:8091/capacity | python3 -m json.tool | head -40
-curl -fsS http://127.0.0.1:8091/violet/info | python3 -m json.tool | head -40
+curl -fsS "http://127.0.0.1:${MINER_PORT:-8091}/health" | python3 -m json.tool | head -40
+curl -fsS "http://127.0.0.1:${MINER_PORT:-8091}/capacity" | python3 -m json.tool | head -40
+curl -fsS "http://127.0.0.1:${MINER_PORT:-8091}/violet/info" | python3 -m json.tool | head -40
 
 # Qualification suite (ASR + TTS contract checks)
-python scripts/run_qualification.py http://127.0.0.1:8091 --services asr,tts
+python scripts/run_qualification.py "http://127.0.0.1:${MINER_PORT:-8091}" --services asr,tts
 ```
 
 Expect `capacity_units > 0` (e.g. H100 → 2.4) and qualification **All tests passed**.  
@@ -334,7 +398,9 @@ Fix any failures before registering.
 
 ---
 
-### 10. Register on the subnet
+### 11. Register on the subnet
+
+Do this only after the miner passes local smoke.
 
 **Testnet (netuid 292):**
 
@@ -357,19 +423,27 @@ btcli subnet register --netuid 39 \
 Confirm registration:
 
 ```bash
-btcli wallet overview --wallet.name my-coldkey --subtensor.network finney   # or test
+btcli wallet overview --wallet.name my-coldkey --subtensor.network test     # or finney
 ```
 
 ---
 
-### 11. Announce your public endpoint on chain
+### 12. Announce your public endpoint on chain
 
 Validators discover you from the **commitment**, not from Docker ports alone.
 
-Ensure `.env` has the real public URL:
+Ensure `.env` has the exact public URL and port that the internet can reach:
 
 ```bash
+MINER_PORT=8091
 MINER_PUBLIC_ENDPOINT=http://YOUR_PUBLIC_IP:8091
+```
+
+If you use another public port, announce that exact port instead:
+
+```bash
+MINER_PORT=9001
+MINER_PUBLIC_ENDPOINT=http://YOUR_PUBLIC_IP:9001
 ```
 
 Dry-run (no transaction):
@@ -384,6 +458,12 @@ Publish:
 python scripts/announce_endpoint.py
 ```
 
+You can override the endpoint one time without editing `.env`:
+
+```bash
+python scripts/announce_endpoint.py --endpoint http://YOUR_PUBLIC_IP:9001
+```
+
 Inspect all announcements on the subnet:
 
 ```bash
@@ -394,7 +474,7 @@ The miner process also re-announces when your endpoint or GPU inventory changes.
 
 ---
 
-### 12. Verify from outside the host
+### 13. Verify from outside the host
 
 From another machine (or phone off Wi‑Fi):
 
@@ -405,9 +485,11 @@ curl -fsS http://YOUR_PUBLIC_IP:8091/capacity
 
 If this fails, fix firewall / security group before expecting validator probes.
 
+If your public port is not `8091`, replace `8091` above with your actual `MINER_PORT`.
+
 ---
 
-### 13. Day-2 operations
+### 14. Day-2 operations
 
 ```bash
 ./violet/miner/start.sh status          # sidecar + ASR/TTS health

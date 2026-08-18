@@ -220,9 +220,10 @@ docker_published_port() {
 resolve_service_ports() {
   local mode="$1"
   local asr_default=9090 tts_default=8002 miner_default=8091
-  local miner_from_docker=""
+  local miner_from_docker="" configured_miner_port=""
 
   compose_files_for "$mode"
+  configured_miner_port="${MINER_PORT:-}"
   miner_from_docker="$(docker_published_port violet-miner "${MINER_PORT:-$miner_default}" || true)"
 
   # Prefer already-healthy real services on the host.
@@ -237,8 +238,14 @@ resolve_service_ports() {
   else
     TTS_PORT="$(pick_port "${TTS_PORT:-}" "$tts_default" 8002 8003 8080)"
   fi
-  MINER_PORT="$(pick_port "${MINER_PORT:-$miner_from_docker}" \
-    "$miner_default" 8092 8093 8191)"
+  # If the operator set MINER_PORT in .env / environment, keep it exactly.
+  # Only auto-pick when no explicit port was configured.
+  if [[ -n "$configured_miner_port" ]]; then
+    MINER_PORT="$configured_miner_port"
+  else
+    MINER_PORT="$(pick_port "${miner_from_docker:-}" \
+      "$miner_default" 8092 8093 8191)"
+  fi
 
   # Sidecar in Docker reaches host services via host.docker.internal.
   # Process-mode / host networking can use 127.0.0.1 instead.

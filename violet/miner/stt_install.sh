@@ -27,7 +27,10 @@ ENV_FILE="${PROJECT_DIR}/.env"
 COMPOSE_FILE="${PROJECT_DIR}/docker-compose.yml"
 NGINX_CONF="${PROJECT_DIR}/nginx-speaches.conf"
 
+# Pick up HF_TOKEN from repo .env (export on CLI still wins if already set).
+load_repo_dotenv "${SCRIPT_DIR}" || true
 DEFAULT_HF_TOKEN="$(default_hf_token)"
+validate_hf_token_value "${DEFAULT_HF_TOKEN}" || exit 1
 ETOIL_HOST_PORT="${ETOIL_HOST_PORT:-9090}"
 SPEACHES_HOST_PORT_BASE="${SPEACHES_HOST_PORT_BASE:-9000}"
 # One replica per GPU (full card) when count>1; set 0 for single multi-GPU container.

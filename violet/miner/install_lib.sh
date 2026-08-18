@@ -80,6 +80,41 @@ prefer_named_volume() {
 # HuggingFace token (set HF_TOKEN in .env — never commit real tokens)
 # --------------------------------------------------------------------------
 
+# Repo root is two levels above violet/miner (cathedral-voice / violet-subnet root).
+miner_repo_root() {
+  local script_dir="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+  cd "${script_dir}/../.." && pwd
+}
+
+# Load repo .env so HF_TOKEN in .env is visible to install scripts (same as start.sh).
+load_repo_dotenv() {
+  local script_dir="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+  local root env_file
+  root="$(miner_repo_root "$script_dir")"
+  env_file="${root}/.env"
+  [[ -f "$env_file" ]] || return 1
+  set -a
+  # shellcheck disable=SC1091
+  source "$env_file"
+  set +a
+  return 0
+}
+
+# HF tokens must be plain ASCII — unicode in Authorization headers crashes huggingface_hub.
+validate_hf_token_value() {
+  local t="${1:-}"
+  [[ -z "$t" ]] && return 0
+  if [[ "$t" == *"[${INSTALL_LOG_PREFIX:-install} warn]"* ]] || [[ "$t" == *"HF_TOKEN unset"* ]]; then
+    _install_err "HF_TOKEN looks corrupted (install warning text was captured). Set HF_TOKEN=hf_... in repo .env or export it before running."
+    return 1
+  fi
+  if ! printf '%s' "$t" | LC_ALL=C grep -Eq '^[ -~]*$'; then
+    _install_err "HF_TOKEN contains non-ASCII characters. Use only hf_... with no em-dashes or smart quotes."
+    return 1
+  fi
+  return 0
+}
+
 default_hf_token() {
   if [[ -n "${HF_TOKEN:-}" ]]; then
     echo "${HF_TOKEN}"
@@ -89,7 +124,7 @@ default_hf_token() {
     echo "${HUGGING_FACE_HUB_TOKEN}"
     return 0
   fi
-  _install_warn "HF_TOKEN unset — private HF pulls may fail. Set HF_TOKEN in .env (see .env.example)."
+  _install_warn "HF_TOKEN unset — private HF pulls may fail. Set HF_TOKEN in .env (see .env.example)." >&2
   echo ""
 }
 
