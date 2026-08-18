@@ -300,7 +300,8 @@ write_env_file() {
   cat > "${ENV_FILE}" <<EOF
 HF_TOKEN=${DEFAULT_HF_TOKEN}
 ETOIL_HOST_PORT=${ETOIL_HOST_PORT}
-STT_GPU_DEVICES=${STT_GPU_DEVICES}
+STT_GPU_DEVICES=${STT_GPU_DEVICES:-}
+STT_FORCE_CPU=${STT_FORCE_CPU}
 GPU_PLAN_MODE=${GPU_PLAN_MODE}
 EOF
   chmod 600 "${ENV_FILE}"
@@ -672,6 +673,7 @@ main() {
   require_sudo
   if [[ "${STT_FORCE_CPU}" == "1" ]]; then
     warn "STT_FORCE_CPU=1 — skipping GPU plan; Whisper runs on CPU."
+    export STT_GPU_DEVICES=""
   else
     plan_gpu_devices "${GPU_PLAN_MODE}"
   fi
@@ -716,7 +718,11 @@ main() {
   log "Done."
   echo "  ASR API (etoil) : http://127.0.0.1:${ETOIL_HOST_PORT}"
   echo "  Miner upstream  : MINER_ASR_UPSTREAM=http://127.0.0.1:${ETOIL_HOST_PORT}"
-  echo "  STT GPUs        : ${STT_GPU_DEVICES}"
+  if [[ "${STT_FORCE_CPU}" == "1" ]]; then
+    echo "  STT mode        : CPU (STT_FORCE_CPU=1)"
+  else
+    echo "  STT GPUs        : ${STT_GPU_DEVICES}"
+  fi
   echo "  Logs            : docker compose -f ${COMPOSE_FILE} logs -f"
   echo "  Stop            : docker compose -f ${COMPOSE_FILE} down"
 }
