@@ -430,9 +430,9 @@ def create_app(state: MinerState) -> FastAPI:
                 detail=f"text exceeds {state.config.max_tts_text_chars} characters",
             )
 
-        # Spark selects timbre from ``voice`` (not ``speaker_id``). Never forward both
-        # naming schemes — Spark returns HTTP 422 (duplicate field).
-        payload = _spark_tts_upstream_payload(raw)
+        # Spark HTTP expects ``text`` + ``speaker_id`` only (not ``input`` + ``voice``).
+        # WS uses the latter — see ``docs/TTS_CONTRACT.md``.
+        payload = _spark_tts_http_upstream_payload(raw)
 
         from ..cathedral.receipt_v1 import receipt_buffer_from_env, receipt_enabled_from_env
 
@@ -530,11 +530,27 @@ def create_app(state: MinerState) -> FastAPI:
     return app
 
 
-def _spark_tts_upstream_payload(raw: dict) -> dict:
-    """Map miner-facing JSON to Spark upstream (``input`` + ``voice`` only).
+def _spark_tts_http_upstream_payload(raw: dict) -> dict:
+    """Map miner-facing JSON to Spark HTTP upstream (``text`` + ``speaker_id`` only).
 
-    Spark rejects payloads that include both ``text`` and ``input`` (duplicate field).
+    Spark's Rust HTTP handler treats ``text``/``input`` and ``speaker_id``/``voice``
+    as aliases — sending both naming schemes returns HTTP 422.
     """
+    text = (raw.get("text") or raw.get("input") or "").strip()
+    speaker_id = (raw.get("speaker_id") or raw.get("voice") or "eng_female_1").strip()
+    try:
+        temperature = float(raw.get("temperature", 0.7))
+    except (TypeError, ValueError):
+        temperature = 0.7
+    return {
+        "text": text,
+        "speaker_id": speaker_id,
+        "temperature": temperature,
+    }
+
+
+def _spark_tts_ws_upstream_payload(raw: dict) -> dict:
+    """Map miner-facing JSON to Spark WebSocket upstream (``input`` + ``voice`` only)."""
     text = (raw.get("text") or raw.get("input") or "").strip()
     voice = (raw.get("speaker_id") or raw.get("voice") or "eng_female_1").strip()
     try:
@@ -559,7 +575,7 @@ def _remap_tts_ws_control_frame(text: str) -> str:
     # Non-synthesis control frames (eos / end / ping) pass through unchanged.
     if not any(k in data for k in ("text", "input", "speaker_id", "voice")):
         return text
-    remapped = _spark_tts_upstream_payload(data)
+    remapped = _spark_tts_ws_upstream_payload(data)
     # Preserve non-conflicting control keys (e.g. type) without dual naming.
     out = {
         key: value
@@ -599,8 +615,8 @@ def _tts_receipt_headers(
     if not receipt_enabled_from_env():
         return {}
 
-    input_text = str(payload.get("input") or "")
-    voice = str(payload.get("voice") or "")
+    input_text = str(payload.get("input") or payload.get("text") or "")
+    voice = str(payload.get("voice") or payload.get("speaker_id") or "")
     temperature = float(payload.get("temperature") or 0.7)
     ed25519_key = (os.getenv("VIOLET_RECEIPT_ED25519_PRIVATE_KEY") or "").strip()
     hmac_secret = (os.getenv("VIOLET_RECEIPT_HMAC_SECRET") or "").strip()

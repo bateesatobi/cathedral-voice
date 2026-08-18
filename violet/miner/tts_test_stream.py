@@ -73,7 +73,7 @@ def tts_payload(text: str, speaker_id: str) -> dict:
             "speaker_name": speaker_id,
             "temperature": 0.7,
         }
-    # Miner API: text + speaker_id (miner translates to input + voice for Spark).
+    # Miner API: text + speaker_id (miner remaps aliases before proxying to Spark).
     return {
         "text": text,
         "speaker_id": speaker_id,

@@ -5,7 +5,17 @@ sidecar that fronts Spark TTS.
 
 ## Allowed upstream payload
 
-Spark receives **exactly**:
+Spark **HTTP** (`POST /v1/audio/speech/stream`) receives **exactly**:
+
+```json
+{
+  "text": "<text to speak>",
+  "speaker_id": "<catalogue voice id>",
+  "temperature": 0.7
+}
+```
+
+Spark **WebSocket** (`/v1/audio/speech/stream/ws`) receives **exactly**:
 
 ```json
 {
@@ -16,18 +26,18 @@ Spark receives **exactly**:
 ```
 
 Do **not** send both `text` and `input`, or both `speaker_id` and `voice`.
-Spark returns HTTP 422 on duplicate fields.
+Spark's Rust API treats those as aliases and returns HTTP 422 on duplicate fields.
 
 ## Miner-facing aliases (deprecated)
 
 The Violet miner sidecar accepts legacy Avoices / router shapes and remaps them
-via `_spark_tts_upstream_payload`:
+via `_spark_tts_http_upstream_payload` (HTTP) or `_spark_tts_ws_upstream_payload` (WS):
 
-| Caller field | Upstream field |
-|--------------|----------------|
-| `input` (preferred) or `text` | `input` |
-| `voice` (preferred) or `speaker_id` | `voice` |
-| `temperature` | `temperature` (default `0.7`) |
+| Caller field | Upstream field (HTTP) | Upstream field (WS) |
+|--------------|----------------------|---------------------|
+| `input` (preferred) or `text` | `text` | `input` |
+| `voice` (preferred) or `speaker_id` | `speaker_id` | `voice` |
+| `temperature` | `temperature` (default `0.7`) | same |
 
 Default voice when omitted: `eng_female_1`.
 
