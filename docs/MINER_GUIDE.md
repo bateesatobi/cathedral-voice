@@ -561,6 +561,8 @@ Details: [MINER_GPU_BOOTSTRAP_REPORT.md](./MINER_GPU_BOOTSTRAP_REPORT.md)
 | `/health` OK locally, validators can't reach you | Public IP, port **8091**, `MINER_PUBLIC_ENDPOINT`, announce; Keenetic must forward **8091** (not just 22/80/443) |
 | Port 80 shows router admin UI | Do not bind miner to 80; forward WAN:8091 → VM:8091 |
 | ASR fails | `docker compose -f violet/miner/stt-stack/docker-compose.yml logs` |
+| ASR `/health` OK, `/transcribe` 500, speaches log `DevicesUnavailable` | Nested Docker — no CUDA alloc. Use bare GPU VM/WSL, or `STT_FORCE_CPU=1` for dev only |
+| STT install stopped at CUDA compute gate | Same as TTS gate — run STT on bare GPU VM/WSL |
 | `mount ... ./audio ... no such file or directory` | Old compose used a bind mount; pull latest `stt_install.sh` (uses `stt-audio` volume) |
 | etoil `EXTERNAL_API_URL` / crash-loop on start | Set `EXTERNAL_API_URL=http://speaches:8000` in compose (fixed in latest `stt_install.sh`) |
 | TTS fails / OOM on 1 GPU | Both stacks share GPU 0 — see GPU report; consider ASR-only or TTS-only host |

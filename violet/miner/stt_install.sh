@@ -12,6 +12,11 @@
 # Usage:
 #   ./violet/miner/stt_install.sh
 #   GPU_PLAN_MODE=both STT_GPU_DEVICES=0,1 ./violet/miner/stt_install.sh
+#   STT_FORCE_CPU=1 ./violet/miner/stt_install.sh       # CPU Whisper (slow; nested Docker)
+#   STT_SKIP_CUDA_PROBE=1 ./violet/miner/stt_install.sh # unsafe override
+#
+# CUDA compute is probed before pull/run (like tts_install.sh). Nested GPU jobs that
+# only expose nvidia-smi are rejected so speaches does not pass /health then 500.
 #
 set -euo pipefail
 
@@ -37,7 +42,11 @@ SPEACHES_HOST_PORT_BASE="${SPEACHES_HOST_PORT_BASE:-9000}"
 STT_SPEACHES_PER_GPU="${STT_SPEACHES_PER_GPU:-1}"
 STT_READY_TRIES="${STT_READY_TRIES:-600}"  # ~20 min for first HF pull
 STT_STRICT="${STT_STRICT:-1}"
+STT_FORCE_CPU="${STT_FORCE_CPU:-0}"
+STT_SKIP_CUDA_PROBE="${STT_SKIP_CUDA_PROBE:-0}"
+STT_CPU_THREADS="${STT_CPU_THREADS:-4}"
 GPU_PLAN_MODE="${GPU_PLAN_MODE:-stt}"
+STT_GPU_RUN_ARGS=()
 
 log()  { echo -e "\033[1;32m[stt_install]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[stt_install warn]\033[0m $*"; }
@@ -49,6 +58,172 @@ require_sudo() {
   else
     SUDO=""
   fi
+}
+
+abort_stt_cuda_environment() {
+  local detail="${1:-CUDA compute probe failed}"
+  err "${detail}"
+  echo
+  echo "STT install stopped — this host cannot run speaches Whisper on GPU."
+  echo "  nvidia-smi can list the GPU while Docker cannot allocate CUDA"
+  echo "  (cudaErrorDevicesUnavailable / DevicesUnavailable on /transcribe)."
+  echo
+  echo "Typical cause: nested Docker (/.dockerenv) — inner containers get NVML only."
+  echo
+  echo "What to do:"
+  echo "  • Run STT on a bare GPU VM or WSL2 where Docker is the host"
+  echo "  • CPU smoke/dev only: STT_FORCE_CPU=1 ./violet/miner/stt_install.sh"
+  echo "  • ASR-only elsewhere: MINER_SERVICES=asr ./violet/miner/start.sh prod --no-follow"
+  echo
+  exit 1
+}
+
+cuda_compute_probe_py() {
+  cat <<'PY'
+import ctypes
+import sys
+
+def load():
+    for name in ("libcuda.so.1", "libcuda.so"):
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    print("PROBE_FAIL libcuda.so.1 missing (GPU not injected into the container)")
+    sys.exit(2)
+
+lib = load()
+lib.cuInit.restype = ctypes.c_int
+lib.cuInit.argtypes = [ctypes.c_uint]
+rc = lib.cuInit(0)
+print("cuInit", rc, flush=True)
+if rc != 0:
+    print("PROBE_FAIL cuInit rc=%s (GPU compute blocked)" % rc)
+    sys.exit(3)
+
+dev = ctypes.c_int()
+lib.cuDeviceGet.restype = ctypes.c_int
+lib.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+rc = lib.cuDeviceGet(ctypes.byref(dev), 0)
+print("cuDeviceGet", rc, "device", dev.value, flush=True)
+if rc != 0:
+    print("PROBE_FAIL cuDeviceGet rc=%s" % rc)
+    sys.exit(4)
+
+ctx = ctypes.c_void_p()
+ctx_rc = -1
+for sym in ("cuCtxCreate_v2", "cuCtxCreate"):
+    if not hasattr(lib, sym):
+        continue
+    fn = getattr(lib, sym)
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint, ctypes.c_int]
+    ctx_rc = fn(ctypes.byref(ctx), 0, dev)
+    print(sym, ctx_rc, flush=True)
+    if ctx_rc == 0:
+        break
+else:
+    print("PROBE_FAIL cuCtxCreate rc=%s (nested Docker often returns busy/unavailable)" % ctx_rc)
+    sys.exit(5)
+if ctx_rc != 0:
+    print("PROBE_FAIL cuCtxCreate rc=%s (nested Docker often returns busy/unavailable)" % ctx_rc)
+    sys.exit(5)
+
+dptr = ctypes.c_void_p()
+mem_rc = -1
+for sym in ("cuMemAlloc_v2", "cuMemAlloc"):
+    if not hasattr(lib, sym):
+        continue
+    fn = getattr(lib, sym)
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+    mem_rc = fn(ctypes.byref(dptr), 4096)
+    print(sym, mem_rc, flush=True)
+    if mem_rc == 0:
+        print("ALLOC_OK")
+        sys.exit(0)
+print("PROBE_FAIL cuMemAlloc rc=%s" % mem_rc)
+sys.exit(6)
+PY
+}
+
+run_cuda_compute_probe() {
+  local out rc=0 probe_py probe_image cuda_dev
+  probe_image="${STT_CUDA_PROBE_IMAGE:-python:3.11-slim-bookworm}"
+  probe_py="$(cuda_compute_probe_py)"
+  cuda_dev="${STT_GPU_DEVICES:-0}"
+  cuda_dev="${cuda_dev%%,*}"
+
+  log "CUDA compute gate: context + 4KiB alloc inside Docker (not nvidia-smi)."
+  if ! $SUDO docker pull "${probe_image}" >/dev/null; then
+    abort_stt_cuda_environment "Could not pull CUDA probe image ${probe_image}."
+  fi
+
+  set +e
+  out="$(
+    $SUDO docker run --rm \
+      "${STT_GPU_RUN_ARGS[@]}" \
+      -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+      -e CUDA_VISIBLE_DEVICES="${cuda_dev}" \
+      -e NVIDIA_VISIBLE_DEVICES="${cuda_dev}" \
+      --entrypoint python3 \
+      "${probe_image}" \
+      -c "${probe_py}" 2>&1
+  )"
+  rc=$?
+  set -e
+
+  echo "${out}" | while IFS= read -r line; do
+    [[ -n "$line" ]] && log "  probe: ${line}"
+  done
+
+  if [[ "$rc" -eq 0 ]] && echo "${out}" | grep -q 'ALLOC_OK'; then
+    log "CUDA compute gate passed — speaches may use GPU."
+    return 0
+  fi
+  abort_stt_cuda_environment "Docker CUDA alloc failed (probe exit ${rc}). nvidia-smi is not sufficient."
+}
+
+speaches_image() {
+  if [[ "${STT_FORCE_CPU}" == "1" ]]; then
+    echo "ghcr.io/speaches-ai/speaches:latest-cpu"
+  else
+    echo "ghcr.io/speaches-ai/speaches:latest-cuda"
+  fi
+}
+
+speaches_whisper_env_block() {
+  if [[ "${STT_FORCE_CPU}" == "1" ]]; then
+    cat <<EOF
+      WHISPER__INFERENCE_DEVICE: cpu
+      WHISPER__CPU_THREADS: "${STT_CPU_THREADS}"
+EOF
+  fi
+}
+
+speaches_gpu_env_block() {
+  local devices="$1"
+  if [[ "${STT_FORCE_CPU}" == "1" || -z "$devices" ]]; then
+    return 0
+  fi
+  cat <<EOF
+      NVIDIA_VISIBLE_DEVICES: "${devices}"
+      CUDA_VISIBLE_DEVICES: "$(gpu_index_list "$(gpu_device_count "$devices")")"
+EOF
+}
+
+speaches_gpu_deploy_block() {
+  local device_yaml="$1"
+  if [[ "${STT_FORCE_CPU}" == "1" ]]; then
+    return 0
+  fi
+  cat <<EOF
+    deploy:
+      resources:
+        reservations:
+          devices:
+${device_yaml}
+EOF
 }
 
 wait_http() {
@@ -148,8 +323,9 @@ EOF
 
 write_compose_single_speaches() {
   local devices="$1"
-  local device_yaml
+  local device_yaml img
   device_yaml="$(gpu_compose_device_ids_yaml "$devices")"
+  img="$(speaches_image)"
 
   cat > "${COMPOSE_FILE}" <<EOF
 # Generated by stt_install.sh — do not edit by hand.
@@ -157,7 +333,7 @@ name: cathedral-voice-stt
 
 services:
   speaches:
-    image: ghcr.io/speaches-ai/speaches:latest-cuda
+    image: ${img}
     container_name: cathedral-speaches
     restart: unless-stopped
     networks: [stt-net]
@@ -165,15 +341,11 @@ services:
       - hf-hub-cache:/home/ubuntu/.cache/huggingface/hub
     environment:
       HF_TOKEN: \${HF_TOKEN}
-      NVIDIA_VISIBLE_DEVICES: "${devices}"
-      CUDA_VISIBLE_DEVICES: "$(gpu_index_list "$(gpu_device_count "$devices")")"
+$(speaches_gpu_env_block "$devices")
+$(speaches_whisper_env_block)
     ports:
       - "127.0.0.1:${SPEACHES_HOST_PORT_BASE}:8000"
-    deploy:
-      resources:
-        reservations:
-          devices:
-${device_yaml}
+$(speaches_gpu_deploy_block "${device_yaml}")
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -214,8 +386,9 @@ EOF
 # One speaches per GPU + nginx LB → every card receives traffic.
 write_compose_per_gpu_speaches() {
   local devices="$1"
-  local id idx=0 port
+  local id idx=0 port img
   local yaml_services="" depends_list="" upstream_servers=""
+  img="$(speaches_image)"
 
   IFS=',' read -r -a arr <<<"$devices"
   for id in "${arr[@]}"; do
@@ -224,7 +397,7 @@ write_compose_per_gpu_speaches() {
     port=$((SPEACHES_HOST_PORT_BASE + idx))
     yaml_services+="
   speaches-${idx}:
-    image: ghcr.io/speaches-ai/speaches:latest-cuda
+    image: ${img}
     container_name: cathedral-speaches-${idx}
     restart: unless-stopped
     networks: [stt-net]
@@ -328,12 +501,21 @@ EOF
 }
 
 write_compose_file() {
-  local devices="${STT_GPU_DEVICES}"
+  local devices="${STT_GPU_DEVICES:-}"
+  local n=0
+
+  if [[ "${STT_FORCE_CPU}" == "1" ]]; then
+    warn "STT_FORCE_CPU=1 — CPU Whisper inference (slow; not for production mining)"
+    log "Mode: single speaches (CPU, latest-cpu image)"
+    write_compose_single_speaches ""
+    log "Wrote ${COMPOSE_FILE}"
+    return 0
+  fi
+
   if [[ -z "$devices" ]]; then
     err "No GPUs assigned to STT (STT_GPU_DEVICES empty). Install NVIDIA drivers or set STT_GPU_DEVICES."
     exit 1
   fi
-  local n
   n="$(gpu_device_count "$devices")"
   log "STT GPUs: ${devices} (count=${n}, plan=${GPU_PLAN_MODE})"
 
@@ -456,7 +638,11 @@ warmup_speaches_model() {
   local timeout_s="${STT_WARMUP_TIMEOUT_S:-600}"
   local tmp wav code
 
-  log "Warming up '${model}' on GPU (first inference loads weights; up to ${timeout_s}s)..."
+  if [[ "${STT_FORCE_CPU}" == "1" ]]; then
+    log "Warming up '${model}' on CPU (first inference loads weights; up to ${timeout_s}s)..."
+  else
+    log "Warming up '${model}' on GPU (first inference loads weights; up to ${timeout_s}s)..."
+  fi
   tmp="$(mktemp -d)"
   wav="${tmp}/tone.wav"
   if ! make_smoke_wav "$wav"; then
@@ -484,14 +670,30 @@ warmup_speaches_model() {
 
 main() {
   require_sudo
-  plan_gpu_devices "${GPU_PLAN_MODE}"
+  if [[ "${STT_FORCE_CPU}" == "1" ]]; then
+    warn "STT_FORCE_CPU=1 — skipping GPU plan; Whisper runs on CPU."
+  else
+    plan_gpu_devices "${GPU_PLAN_MODE}"
+  fi
   check_disk_gb 40 "${PROJECT_DIR}" || warn "Low disk — HF model pulls may fail"
   install_docker
-  install_nvidia_toolkit_if_needed "$SUDO"
-  if command -v nvidia-smi &>/dev/null; then
-    log "GPUs: $(nvidia-smi --query-gpu=name --format=csv,noheader | paste -sd'; -')"
-  else
-    warn "nvidia-smi not found — speaches needs an NVIDIA GPU + driver."
+  if [[ "${STT_FORCE_CPU}" != "1" ]]; then
+    install_nvidia_toolkit_if_needed "$SUDO"
+    if command -v nvidia-smi &>/dev/null; then
+      log "GPUs: $(nvidia-smi --query-gpu=name --format=csv,noheader | paste -sd'; -')"
+    else
+      warn "nvidia-smi not found — speaches needs an NVIDIA GPU + driver."
+    fi
+    if [[ -n "${STT_GPU_DEVICES:-}" ]]; then
+      STT_GPU_RUN_ARGS=(--gpus "device=${STT_GPU_DEVICES}")
+    else
+      STT_GPU_RUN_ARGS=(--gpus all)
+    fi
+    if [[ "${STT_SKIP_CUDA_PROBE}" == "1" ]]; then
+      warn "STT_SKIP_CUDA_PROBE=1 — skipping CUDA compute gate (unsafe; /transcribe may 500)."
+    else
+      run_cuda_compute_probe
+    fi
   fi
   write_env_file
   warn_docker_in_docker
