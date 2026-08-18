@@ -207,6 +207,13 @@ admission_checklist() {
 
 export SKIP_ENDPOINT_PROMPT="${SKIP_ENDPOINT_PROMPT:-0}"
 # bootstrap always runs full start; stop-all available via start.sh stop-all
+# shellcheck disable=SC1091
+[[ -f .env ]] && set -a && source .env && set +a
+if [[ ",${MINER_SERVICES:-asr,tts}," == *",tts,"* ]]; then
+  log "TTS requires a bare GPU VM or WSL (Docker as the host)."
+  log "Nested GPU jobs often pass nvidia-smi and fail CUDA alloc — tts_install will abort."
+  log "ASR-only on this host: MINER_SERVICES=asr ./violet/miner/bootstrap.sh ${MODE}"
+fi
 log "Starting miner (${MODE}) with full GPU utilization..."
 "${SCRIPT_DIR}/start.sh" "${MODE}" "$@"
 

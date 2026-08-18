@@ -77,6 +77,7 @@ Or auto-fetch during bootstrap: `FETCH_MINER_TOKEN=1 ./violet/miner/bootstrap.sh
 | Requirement | Why |
 |-------------|-----|
 | **NVIDIA GPU** (A100 / H100 / H200 class) | Real ASR/TTS inference |
+| **Bare GPU VM or WSL2** (Docker is the **host**) | TTS CUDA. Nested GPU jobs/`/.dockerenv` usually cannot allocate CUDA |
 | **Ubuntu 22.04+** (or similar Linux) | Install scripts target Debian/Ubuntu |
 | **Docker + Docker Compose** | Sidecar + inference containers |
 | **NVIDIA driver** | GPU must show in `nvidia-smi` |
@@ -107,6 +108,33 @@ nc -vz YOUR_PUBLIC_IP 8091
 ```
 
 Install scripts print this as the remaining manual step after local smoke passes.
+
+---
+
+## TTS host — read this before installing Spark
+
+`nvidia-smi` listing an H100 is **not** enough. Spark-TTS needs Docker to **allocate CUDA** (`cuCtxCreate` / `cuMemAlloc`). Nested GPU products (Datura/Lium-style jobs, `/.dockerenv`, Docker-in-Docker) often show the GPU and then fail with `CUDA-capable device(s) is/are busy or unavailable`. Installing TTS there hangs or crashes.
+
+| Host | TTS | ASR |
+|------|-----|-----|
+| Ubuntu VM / WSL2, Docker is the host | yes | yes |
+| Nested GPU job / space inside a container | **no** (`tts_install` aborts) | often yes |
+| Attested / confidential GPU (TEE) | avoid | avoid |
+
+`tts_install.sh` runs a **CUDA compute gate** before pulling/starting Spark. If the gate fails, install **stops** (it will not leave a crashing TTS container).
+
+```bash
+# Must print ALLOC_OK on a TTS-capable host
+./violet/miner/tts_install.sh
+```
+
+On a nested host, serve ASR only:
+
+```bash
+MINER_SERVICES=asr ./violet/miner/start.sh prod --gpu --no-follow
+```
+
+Do not use `TTS_FORCE_CPU=1` unless you accept multi-second TTS latency. `TTS_SKIP_CUDA_PROBE=1` is unsafe.
 
 ---
 
@@ -232,7 +260,7 @@ BT_NETWORK=test                 # or finney
 BT_WALLET_NAME=my-coldkey
 BT_WALLET_HOTKEY=my-miner
 
-MINER_SERVICES=asr,tts
+MINER_SERVICES=asr,tts          # use `asr` only if CUDA compute gate fails
 MINER_PORT=8091
 ASR_PORT=9090
 TTS_PORT=8002
@@ -245,7 +273,8 @@ MINER_TTS_UPSTREAM=http://host.docker.internal:8002
 # Must match the public port you expose on the host/router.
 MINER_PUBLIC_ENDPOINT=http://YOUR_PUBLIC_IP:8091
 
-# Required for private / gated Hugging Face pulls used by STT/TTS.
+# Required for private / gated Hugging Face pulls used by STT.
+# TTS image has models baked in (no HF_TOKEN for tts_install).
 # Use plain ASCII only: hf_... (no smart quotes, no em-dashes, no trailing comments)
 HF_TOKEN=hf_...
 ```
@@ -310,22 +339,23 @@ export HF_TOKEN="$(grep '^HF_TOKEN=' .env | cut -d= -f2-)"
 # ASR: speaches + etoil-api -> :9090
 ./violet/miner/stt_install.sh
 
-# TTS: Spark-TTS -> :8002
+# TTS: spark-tts-frontend -> :8002 (models baked in; no HF_TOKEN)
+# Aborts if Docker cannot allocate CUDA (nested GPU jobs).
 ./violet/miner/tts_install.sh
 ```
 
 What success looks like:
 
 - STT: `Contract smoke: POST /transcribe -> 200`
-- TTS: service answers on `http://127.0.0.1:8002/` or the stream endpoint
+- TTS: CUDA gate prints `ALLOC_OK`, then `spark-tts-frontend` answers on `http://127.0.0.1:8002/`
 
 If you want the sidecar to install them automatically, skip this step and use `bootstrap.sh` in step 9.
 
 Known issues we hit in practice:
 
-- If `stt_install.sh` shows Hugging Face / `UnicodeEncodeError` failures, your `HF_TOKEN` is missing or malformed. Re-check `.env` and re-export `HF_TOKEN`.
-- On a single GPU in nested Docker, TTS may load the text model on GPU and keep BiCodec on CPU. That is acceptable if the service still becomes healthy.
-- If TTS cannot start reliably on the GPU, try:
+- If `stt_install.sh` shows Hugging Face / `UnicodeEncodeError` failures, your `HF_TOKEN` is missing or malformed. Re-check `.env` and re-export `HF_TOKEN`. TTS does not need `HF_TOKEN`.
+- If `tts_install.sh` stops at **CUDA compute gate**, this host cannot run TTS in Docker. Use `MINER_SERVICES=asr` here, and run TTS on a bare GPU VM or WSL.
+- CPU TTS (slow, not recommended):
 
 ```bash
 TTS_FORCE_CPU=1 ./violet/miner/tts_install.sh
@@ -534,6 +564,7 @@ Details: [MINER_GPU_BOOTSTRAP_REPORT.md](./MINER_GPU_BOOTSTRAP_REPORT.md)
 | `mount ... ./audio ... no such file or directory` | Old compose used a bind mount; pull latest `stt_install.sh` (uses `stt-audio` volume) |
 | etoil `EXTERNAL_API_URL` / crash-loop on start | Set `EXTERNAL_API_URL=http://speaches:8000` in compose (fixed in latest `stt_install.sh`) |
 | TTS fails / OOM on 1 GPU | Both stacks share GPU 0 — see GPU report; consider ASR-only or TTS-only host |
-| TTS crash-loop / corrupt tokenizer | Set `HF_TOKEN` and re-run `tts_install.sh` |
+| TTS install stopped at CUDA compute gate | Nested Docker / no CUDA alloc. Use `MINER_SERVICES=asr` or a bare GPU VM/WSL |
+| TTS crash-loop / DevicesUnavailable | Same as CUDA gate — do not force-install on that host |
 | `btcli` / announce errors | `BT_NETWORK`, wallet path, TAO balance, netuid **39** vs **292** |
 | No emissions | Registered? Announced? GPUs in allowed tier? Passing qualification? |
