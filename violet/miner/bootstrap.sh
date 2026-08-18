@@ -209,6 +209,15 @@ export SKIP_ENDPOINT_PROMPT="${SKIP_ENDPOINT_PROMPT:-0}"
 # bootstrap always runs full start; stop-all available via start.sh stop-all
 # shellcheck disable=SC1091
 [[ -f .env ]] && set -a && source .env && set +a
+
+if [[ -x "${SCRIPT_DIR}/detect_gpu_space.sh" ]]; then
+  log "GPU space preflight"
+  if ! "${SCRIPT_DIR}/detect_gpu_space.sh"; then
+    warn "GPU space check reported issues — see above before expecting GPU inference"
+  fi
+  echo
+fi
+
 if [[ ",${MINER_SERVICES:-asr,tts}," == *",tts,"* ]]; then
   log "TTS requires a bare GPU VM or WSL (Docker as the host)."
   log "Nested GPU jobs often pass nvidia-smi and fail CUDA alloc — tts_install will abort."

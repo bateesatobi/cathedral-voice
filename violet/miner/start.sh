@@ -7,6 +7,7 @@
 #   ./violet/miner/bootstrap.sh test|prod   # fail-closed checklist wrapper
 #
 # Flow:
+#   0. detect_gpu_space.sh (via bootstrap or MINER_INFERENCE_DEPLOY=auto)
 #   1. ensure .env + public endpoint (validated; reject paste garbage)
 #   2. plan GPUs from MINER_SERVICES (solo → ALL GPUs; both → full partition)
 #   3. stt_install.sh → etoil-api :9090 (+ speaches + LB when multi-GPU)
@@ -367,16 +368,91 @@ open_miner_firewall() {
   fi
 }
 
+resolve_inference_deploy() {
+  local mode="${MINER_INFERENCE_DEPLOY:-auto}"
+  case "$mode" in
+    compose|run|cpu)
+      echo "$mode"
+      return 0
+      ;;
+    auto)
+      classify_gpu_space
+      case "$GPU_SPACE_DEPLOY" in
+        compose|run|cpu_fallback)
+          if [[ "$GPU_SPACE_DEPLOY" == cpu_fallback ]]; then
+            echo "cpu"
+          else
+            echo "$GPU_SPACE_DEPLOY"
+          fi
+          ;;
+        *)
+          echo "compose"
+          ;;
+      esac
+      ;;
+    *)
+      echo "WARN: unknown MINER_INFERENCE_DEPLOY=${mode}; using compose" >&2
+      echo "compose"
+      ;;
+  esac
+}
+
+install_inference_stt() {
+  local miner_dir="$1" plan_mode="$2" deploy="$3"
+  if [[ "$deploy" == "run" ]]; then
+    GPU_PLAN_MODE="$plan_mode" GPU_PLAN_LOCKED=1 \
+      ETOIL_HOST_PORT="${ASR_PORT}" \
+      STT_GPU_DEVICES="${STT_GPU_DEVICES:-}" \
+      "${miner_dir}/inference_run_install.sh" stt
+  elif [[ "$deploy" == "cpu" ]]; then
+    STT_FORCE_CPU=1 GPU_PLAN_MODE="$plan_mode" GPU_PLAN_LOCKED=1 \
+      ETOIL_HOST_PORT="${ASR_PORT}" \
+      "${miner_dir}/stt_install.sh"
+  else
+    GPU_PLAN_MODE="$plan_mode" GPU_PLAN_LOCKED=1 \
+      ETOIL_HOST_PORT="${ASR_PORT}" \
+      STT_GPU_DEVICES="${STT_GPU_DEVICES}" \
+      TTS_GPU_DEVICES="${TTS_GPU_DEVICES}" \
+      "${miner_dir}/stt_install.sh"
+  fi
+}
+
+install_inference_tts() {
+  local miner_dir="$1" plan_mode="$2" deploy="$3"
+  if [[ "$deploy" == "run" ]]; then
+    GPU_PLAN_MODE="$plan_mode" GPU_PLAN_LOCKED=1 \
+      TTS_HOST_PORT="${TTS_PORT}" \
+      TTS_GPU_DEVICES="${TTS_GPU_DEVICES:-}" \
+      "${miner_dir}/inference_run_install.sh" tts
+  else
+    if ! GPU_PLAN_MODE="$plan_mode" GPU_PLAN_LOCKED=1 \
+      TTS_HOST_PORT="${TTS_PORT}" \
+      HOST_PORT="${TTS_PORT}" \
+      STT_GPU_DEVICES="${STT_GPU_DEVICES}" \
+      TTS_GPU_DEVICES="${TTS_GPU_DEVICES}" \
+      CUDA_VISIBLE_DEVICES="${TTS_GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-0}}" \
+      "${miner_dir}/tts_install.sh"; then
+      return 1
+    fi
+  fi
+}
+
 ensure_inference_stacks() {
   local miner_dir="$ROOT/violet/miner"
-  local plan_mode
+  local plan_mode deploy
   # shellcheck source=gpu_env.sh
   source "${miner_dir}/gpu_env.sh"
   plan_mode="$(gpu_plan_mode_for_services)"
   export GPU_PLAN_MODE="$plan_mode"
   plan_gpu_devices "$plan_mode"
   export GPU_PLAN_LOCKED=1
+  deploy="$(resolve_inference_deploy)"
   echo "==> GPU plan mode=${plan_mode} count=${GPU_COUNT:-?} STT=[${STT_GPU_DEVICES:-}] TTS=[${TTS_GPU_DEVICES:-}]"
+  echo "==> inference deploy mode=${deploy} (MINER_INFERENCE_DEPLOY=${MINER_INFERENCE_DEPLOY:-auto})"
+  if [[ "${deploy}" == "cpu" ]]; then
+    echo "==> NVML-only / CPU fallback — GPU inference not available on this host"
+    echo "    Run ./violet/miner/detect_gpu_space.sh for details"
+  fi
   if [[ "${GPU_COUNT:-0}" -ge 1 ]]; then
     assert_no_idle_gpus "${GPU_COUNT}" \
       "${STT_GPU_DEVICES:-}" "${TTS_GPU_DEVICES:-}" \
@@ -385,12 +461,8 @@ ensure_inference_stacks() {
 
   if services_want_asr; then
     if ! port_health_ok "${ASR_PORT}"; then
-      echo "==> installing / starting STT (etoil-api + speaches, all STT GPUs)"
-      GPU_PLAN_MODE="$plan_mode" GPU_PLAN_LOCKED=1 \
-        ETOIL_HOST_PORT="${ASR_PORT}" \
-        STT_GPU_DEVICES="${STT_GPU_DEVICES}" \
-        TTS_GPU_DEVICES="${TTS_GPU_DEVICES}" \
-        "${miner_dir}/stt_install.sh"
+      echo "==> installing / starting STT (deploy=${deploy})"
+      install_inference_stt "$miner_dir" "$plan_mode" "$deploy"
     else
       echo "==> ASR already healthy on :${ASR_PORT}"
     fi
@@ -399,15 +471,11 @@ ensure_inference_stacks() {
   fi
 
   if services_want_tts; then
-    if ! port_health_ok "${TTS_PORT}"; then
-      echo "==> installing / starting TTS (Spark) — CUDA compute gate runs first"
-      if ! GPU_PLAN_MODE="$plan_mode" GPU_PLAN_LOCKED=1 \
-        TTS_HOST_PORT="${TTS_PORT}" \
-        HOST_PORT="${TTS_PORT}" \
-        STT_GPU_DEVICES="${STT_GPU_DEVICES}" \
-        TTS_GPU_DEVICES="${TTS_GPU_DEVICES}" \
-        CUDA_VISIBLE_DEVICES="${TTS_GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-0}}" \
-        "${miner_dir}/tts_install.sh"; then
+    if [[ "${deploy}" == "cpu" ]]; then
+      echo "==> skipping TTS — CPU-only host (use bare GPU VM for TTS)"
+    elif ! port_health_ok "${TTS_PORT}"; then
+      echo "==> installing / starting TTS (deploy=${deploy})"
+      if ! install_inference_tts "$miner_dir" "$plan_mode" "$deploy"; then
         echo
         echo "==> TTS install aborted (GPU compute not available in Docker)."
         echo "    ASR-only:  MINER_SERVICES=asr $0 ${MODE:-prod} --gpu --no-follow"

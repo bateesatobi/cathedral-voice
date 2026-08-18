@@ -290,6 +290,193 @@ PY
 }
 
 # --------------------------------------------------------------------------
+# GPU space detection (NVML vs CUDA compute)
+# --------------------------------------------------------------------------
+
+# Prints Python source for cuInit → cuCtxCreate → cuMemAlloc probe.
+cuda_compute_probe_py() {
+  cat <<'PY'
+import ctypes
+import sys
+
+def load():
+    for name in ("libcuda.so.1", "libcuda.so"):
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    print("PROBE_FAIL libcuda.so.1 missing")
+    sys.exit(2)
+
+lib = load()
+lib.cuInit.restype = ctypes.c_int
+lib.cuInit.argtypes = [ctypes.c_uint]
+rc = lib.cuInit(0)
+print("cuInit", rc, flush=True)
+if rc != 0:
+    print("PROBE_FAIL cuInit rc=%s" % rc)
+    sys.exit(3)
+
+dev = ctypes.c_int()
+lib.cuDeviceGet.restype = ctypes.c_int
+lib.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+rc = lib.cuDeviceGet(ctypes.byref(dev), 0)
+print("cuDeviceGet", rc, "device", dev.value, flush=True)
+if rc != 0:
+    print("PROBE_FAIL cuDeviceGet rc=%s" % rc)
+    sys.exit(4)
+
+ctx = ctypes.c_void_p()
+ctx_rc = -1
+for sym in ("cuCtxCreate_v2", "cuCtxCreate"):
+    if not hasattr(lib, sym):
+        continue
+    fn = getattr(lib, sym)
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint, ctypes.c_int]
+    ctx_rc = fn(ctypes.byref(ctx), 0, dev)
+    print(sym, ctx_rc, flush=True)
+    if ctx_rc == 0:
+        break
+else:
+    print("PROBE_FAIL cuCtxCreate rc=%s" % ctx_rc)
+    sys.exit(5)
+if ctx_rc != 0:
+    print("PROBE_FAIL cuCtxCreate rc=%s" % ctx_rc)
+    sys.exit(5)
+
+dptr = ctypes.c_void_p()
+mem_rc = -1
+for sym in ("cuMemAlloc_v2", "cuMemAlloc"):
+    if not hasattr(lib, sym):
+        continue
+    fn = getattr(lib, sym)
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+    mem_rc = fn(ctypes.byref(dptr), 4096)
+    print(sym, mem_rc, flush=True)
+    if mem_rc == 0:
+        print("ALLOC_OK")
+        sys.exit(0)
+print("PROBE_FAIL cuMemAlloc rc=%s" % mem_rc)
+sys.exit(6)
+PY
+}
+
+# Run CUDA compute probe in the current shell namespace (no Docker).
+# Sets GPU_PROBE_SHELL_RC and GPU_PROBE_SHELL_OUT.
+cuda_probe_shell_namespace() {
+  local probe_py
+  GPU_PROBE_SHELL_OUT=""
+  GPU_PROBE_SHELL_RC=127
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 1
+  fi
+  probe_py="$(cuda_compute_probe_py)"
+  set +e
+  GPU_PROBE_SHELL_OUT="$(python3 -c "${probe_py}" 2>&1)"
+  GPU_PROBE_SHELL_RC=$?
+  set -e
+  return 0
+}
+
+# Run CUDA compute probe inside `docker run --gpus …`.
+# Args: sudo_prefix gpu_run_args_csv cuda_visible_devices
+cuda_probe_docker_namespace() {
+  local sudo_prefix="${1:-}" gpu_args="${2:-all}" cuda_dev="${3:-0}" probe_image out rc probe_py
+  probe_image="${CUDA_PROBE_IMAGE:-python:3.11-slim-bookworm}"
+  probe_py="$(cuda_compute_probe_py)"
+  GPU_PROBE_DOCKER_OUT=""
+  GPU_PROBE_DOCKER_RC=127
+
+  if ! command -v docker >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local -a run_args=()
+  if [[ -n "$gpu_args" && "$gpu_args" != "none" ]]; then
+    run_args=(--gpus "$gpu_args")
+  fi
+
+  set +e
+  out="$(
+    ${sudo_prefix} docker run --rm \
+      "${run_args[@]}" \
+      -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+      -e CUDA_VISIBLE_DEVICES="${cuda_dev}" \
+      -e NVIDIA_VISIBLE_DEVICES="${cuda_dev}" \
+      --entrypoint python3 \
+      "${probe_image}" \
+      -c "${probe_py}" 2>&1
+  )"
+  rc=$?
+  set -e
+  GPU_PROBE_DOCKER_OUT="$out"
+  GPU_PROBE_DOCKER_RC=$rc
+  return 0
+}
+
+gpu_probe_has_alloc_ok() {
+  local text="${1:-}"
+  [[ "$text" == *ALLOC_OK* ]]
+}
+
+# Classify GPU environment. Sets GPU_SPACE_CLASS and GPU_SPACE_DEPLOY.
+# Values: bare_gpu_ok | host_socket_gpu_ok | shell_only_gpu | nvml_only | no_gpu
+classify_gpu_space() {
+  local nested=0 has_smi=0 smi_works=0 shell_ok=0 docker_ok=0
+  GPU_SPACE_CLASS="no_gpu"
+  GPU_SPACE_DEPLOY="none"
+
+  if is_nested_docker; then
+    nested=1
+  fi
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    has_smi=1
+    if nvidia-smi >/dev/null 2>&1; then
+      smi_works=1
+    fi
+  fi
+
+  cuda_probe_shell_namespace || true
+  if gpu_probe_has_alloc_ok "${GPU_PROBE_SHELL_OUT:-}"; then
+    shell_ok=1
+  fi
+
+  cuda_probe_docker_namespace "" "all" "0" || true
+  if gpu_probe_has_alloc_ok "${GPU_PROBE_DOCKER_OUT:-}"; then
+    docker_ok=1
+  fi
+
+  if (( docker_ok )); then
+    if (( nested )); then
+      GPU_SPACE_CLASS="host_socket_gpu_ok"
+      GPU_SPACE_DEPLOY="run"
+    else
+      GPU_SPACE_CLASS="bare_gpu_ok"
+      GPU_SPACE_DEPLOY="compose"
+    fi
+    return 0
+  fi
+
+  if (( shell_ok )); then
+    GPU_SPACE_CLASS="shell_only_gpu"
+    GPU_SPACE_DEPLOY="run"
+    return 0
+  fi
+
+  if (( smi_works )); then
+    GPU_SPACE_CLASS="nvml_only"
+    GPU_SPACE_DEPLOY="cpu_fallback"
+    return 0
+  fi
+
+  GPU_SPACE_CLASS="no_gpu"
+  GPU_SPACE_DEPLOY="none"
+  return 0
+}
+
+# --------------------------------------------------------------------------
 # Wallet volume (DinD-safe tar pipe + chown for miner uid 10001)
 # --------------------------------------------------------------------------
 

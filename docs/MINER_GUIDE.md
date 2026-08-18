@@ -111,6 +111,37 @@ Install scripts print this as the remaining manual step after local smoke passes
 
 ---
 
+## GPU space detection (run this first)
+
+Before spending time on STT/TTS install, classify the host:
+
+```bash
+./violet/miner/detect_gpu_space.sh
+```
+
+| Class | Meaning | Deploy mode |
+|-------|---------|-------------|
+| `bare_gpu_ok` | Bare GPU VM — full CUDA in Docker | `compose` (default) |
+| `host_socket_gpu_ok` | GPU tenant with working `docker run --gpus` | `run` |
+| `shell_only_gpu` | CUDA in shell only — experimental | `run` |
+| `nvml_only` | `nvidia-smi` works, `cuCtxCreate` fails (999) | `cpu` fallback only |
+| `no_gpu` | No usable GPU | fix drivers / pick another offer |
+
+Set in `.env` (or export):
+
+```bash
+MINER_INFERENCE_DEPLOY=auto   # default — picks compose | run | cpu from detect
+# MINER_INFERENCE_DEPLOY=compose   # docker-compose stacks (bare GPU VM)
+# MINER_INFERENCE_DEPLOY=run       # single-container docker run (GPU tenants)
+# MINER_INFERENCE_DEPLOY=cpu       # STT_FORCE_CPU dev smoke (not for mining)
+```
+
+**Run mode** (`inference_run_install.sh`): one `docker run` per service on a shared bridge network — no compose file. Use when the host Docker socket can allocate GPU but compose bridges misbehave.
+
+**NVML-only hosts** (nested GPU jobs like Datura/Lium spaces): neither compose nor run mode will use the H100 for inference. Move to a **bare GPU VM** (Chutes-style: K8s on bare metal, not DinD).
+
+---
+
 ## TTS host — read this before installing Spark
 
 `nvidia-smi` listing an H100 is **not** enough. Spark-TTS needs Docker to **allocate CUDA** (`cuCtxCreate` / `cuMemAlloc`). Nested GPU products (Datura/Lium-style jobs, `/.dockerenv`, Docker-in-Docker) often show the GPU and then fail with `CUDA-capable device(s) is/are busy or unavailable`. Installing TTS there hangs or crashes.
@@ -561,7 +592,8 @@ Details: [MINER_GPU_BOOTSTRAP_REPORT.md](./MINER_GPU_BOOTSTRAP_REPORT.md)
 | `/health` OK locally, validators can't reach you | Public IP, port **8091**, `MINER_PUBLIC_ENDPOINT`, announce; Keenetic must forward **8091** (not just 22/80/443) |
 | Port 80 shows router admin UI | Do not bind miner to 80; forward WAN:8091 → VM:8091 |
 | ASR fails | `docker compose -f violet/miner/stt-stack/docker-compose.yml logs` |
-| ASR `/health` OK, `/transcribe` 500, speaches log `DevicesUnavailable` | Nested Docker — no CUDA alloc. Use bare GPU VM/WSL, or `STT_FORCE_CPU=1` for dev only |
+| ASR `/health` OK, `/transcribe` 500, speaches log `DevicesUnavailable` | Nested Docker — no CUDA alloc. Run `./violet/miner/detect_gpu_space.sh` |
+| `cuCtxCreate 999` / NVML-only H100 | Not fixable in software — bare GPU VM required for GPU inference |
 | STT install stopped at CUDA compute gate | Same as TTS gate — run STT on bare GPU VM/WSL |
 | `mount ... ./audio ... no such file or directory` | Old compose used a bind mount; pull latest `stt_install.sh` (uses `stt-audio` volume) |
 | etoil `EXTERNAL_API_URL` / crash-loop on start | Set `EXTERNAL_API_URL=http://speaches:8000` in compose (fixed in latest `stt_install.sh`) |
