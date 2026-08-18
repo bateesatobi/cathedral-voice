@@ -105,6 +105,19 @@ detect_public_ip() {
   return 1
 }
 
+endpoint_port() {
+  local ep="${1:-}" rest port
+  [[ -z "$ep" ]] && return 1
+  rest="${ep#http://}"
+  rest="${rest#https://}"
+  rest="${rest%%/*}"
+  if [[ "$rest" =~ :([0-9]+)$ ]]; then
+    port="${BASH_REMATCH[1]}"
+    [[ "$port" =~ ^[0-9]+$ ]] && { echo "$port"; return 0; }
+  fi
+  return 1
+}
+
 is_local_endpoint() {
   local ep="${1:-}"
   [[ -z "$ep" ]] && return 0
@@ -220,10 +233,19 @@ docker_published_port() {
 resolve_service_ports() {
   local mode="$1"
   local asr_default=9090 tts_default=8002 miner_default=8091
-  local miner_from_docker="" configured_miner_port=""
+  local miner_from_docker="" configured_miner_port="" endpoint_configured_port=""
 
   compose_files_for "$mode"
   configured_miner_port="${MINER_PORT:-}"
+  endpoint_configured_port="$(endpoint_port "${MINER_PUBLIC_ENDPOINT:-}" || true)"
+  if [[ -n "$endpoint_configured_port" ]]; then
+    if [[ -z "$configured_miner_port" ]]; then
+      configured_miner_port="$endpoint_configured_port"
+    elif [[ "$configured_miner_port" != "$endpoint_configured_port" ]]; then
+      echo "==> MINER_PUBLIC_ENDPOINT port ${endpoint_configured_port} overrides MINER_PORT=${configured_miner_port}"
+      configured_miner_port="$endpoint_configured_port"
+    fi
+  fi
   miner_from_docker="$(docker_published_port violet-miner "${MINER_PORT:-$miner_default}" || true)"
 
   # Prefer already-healthy real services on the host.

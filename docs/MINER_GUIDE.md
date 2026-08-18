@@ -261,6 +261,7 @@ Notes:
 - `MINER_PORT` is the miner sidecar listen port, and `start.sh` now uses it as-is when it is set.
 - `MINER_PUBLIC_ENDPOINT` is what gets announced on chain.
 - If you change the public port, change **both** `MINER_PORT` and `MINER_PUBLIC_ENDPOINT`.
+- If `MINER_PUBLIC_ENDPOINT` already includes a port, `start.sh` syncs `MINER_PORT` to that port.
 - Keep `ASR_PORT` and `TTS_PORT` private unless you intentionally publish them.
 
 ---
