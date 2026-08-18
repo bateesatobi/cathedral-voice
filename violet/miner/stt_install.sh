@@ -360,7 +360,8 @@ $(speaches_gpu_deploy_block "${device_yaml}")
     restart: unless-stopped
     networks: [stt-net]
     ports:
-      - "127.0.0.1:\${ETOIL_HOST_PORT:-9090}:8000"
+      # 0.0.0.0 bind — sidecar in Docker reaches ASR via host.docker.internal
+      - "\${ETOIL_HOST_PORT:-9090}:8000"
     volumes:
       - stt-audio:/app/audio
     environment:
@@ -477,7 +478,8 @@ ${depends_list}
     restart: unless-stopped
     networks: [stt-net]
     ports:
-      - "127.0.0.1:\${ETOIL_HOST_PORT:-9090}:8000"
+      # 0.0.0.0 bind — sidecar in Docker reaches ASR via host.docker.internal
+      - "\${ETOIL_HOST_PORT:-9090}:8000"
     volumes:
       - stt-audio:/app/audio
     environment:
@@ -717,7 +719,7 @@ main() {
 
   log "Done."
   echo "  ASR API (etoil) : http://127.0.0.1:${ETOIL_HOST_PORT}"
-  echo "  Miner upstream  : MINER_ASR_UPSTREAM=http://127.0.0.1:${ETOIL_HOST_PORT}"
+  echo "  Miner upstream  : MINER_ASR_UPSTREAM=http://host.docker.internal:${ETOIL_HOST_PORT}"
   if [[ "${STT_FORCE_CPU}" == "1" ]]; then
     echo "  STT mode        : CPU (STT_FORCE_CPU=1)"
   else

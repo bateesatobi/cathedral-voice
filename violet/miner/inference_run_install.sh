@@ -133,7 +133,9 @@ install_stt_run() {
     --name cathedral-etoil-api \
     --restart unless-stopped \
     --network "$net" \
-    -p "127.0.0.1:${ETOIL_HOST_PORT}:8000" \
+    # Bind 0.0.0.0 (not 127.0.0.1) so the miner sidecar can reach etoil via
+    # host.docker.internal on Linux Docker.
+    -p "${ETOIL_HOST_PORT}:8000" \
     -v "${vol_etoil}:/app/audio" \
     -e EXTERNAL_API_URL="http://cathedral-speaches:8000" \
     -e SPEACHES_BASE_URL="http://cathedral-speaches:8000" \

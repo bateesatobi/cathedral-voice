@@ -1,214 +1,151 @@
 # Miner Guide — cathedral-voice
 
-Complete step-by-step guide: install, register, run, and verify a **cathedral-voice** miner on **testnet** or **mainnet**.
+Step-by-step guide to install, run, register, and verify a **cathedral-voice** miner on **testnet** or **mainnet**.
 
----
-
-## Networks
-
-| | **Mainnet** | **Testnet** |
-|--|-------------|-------------|
-| Bittensor network | `finney` | `test` |
-| Subnet netuid | **39** | **292** |
-| `.env` | `BT_NETWORK=finney` | `BT_NETWORK=test` |
-| Override (optional) | `VIOLET_NETUID=39` | `VIOLET_NETUID=292` |
+| | |
+|--|--|
+| **Repo home** | [README.md](../README.md) |
+| **Script cheat sheet** | [violet/miner/README.md](../violet/miner/README.md) |
+| **Mainnet** | `BT_NETWORK=finney` → netuid **39** |
+| **Testnet** | `BT_NETWORK=test` → netuid **292** |
 
 Leave `VIOLET_NETUID` blank — the repo picks **39** or **292** from `BT_NETWORK`.
 
 ---
 
-## What validators and the router consume
+## Table of contents
 
-You announce **one** public URL (`MINER_PUBLIC_ENDPOINT`, port **8091**).  
-Internal ASR (`:9090`) and TTS (`:8002`) stay private; the sidecar proxies them.
-
-| Method | Path | Required | Used for |
-|--------|------|----------|----------|
-| GET | `/health` | yes | Reachability, services, upstreams, capacity snapshot |
-| GET | `/capacity` | yes | GPU inventory → Capacity (C) score |
-| GET | `/violet/info` | yes | Hotkey, uid, services, warnings |
-| POST | `/transcribe` | yes (if ASR) | Batch ASR probes + product traffic |
-| WS | `/realtime/transcribe` | yes (if ASR) | Streaming ASR probes |
-| POST | `/v1/audio/speech/stream` | yes (if TTS) | TTS probes + product traffic |
-| GET | `/v1/voices` | optional | Voice catalogue |
-| WS | `/v1/audio/speech/stream/ws` | optional | Streaming TTS |
-
-**On-chain (no emissions without these):**
-
-1. Register → chain assigns **UID** to your hotkey  
-2. Announce `MINER_PUBLIC_ENDPOINT` (commitment)  
-3. Keep TCP **8091** reachable from the public internet  
-4. Run with wallet loaded (`start.sh prod`) so `/health` shows your hotkey  
-
-`.env` uses wallet **names** only (`BT_WALLET_NAME` / `BT_WALLET_HOTKEY`) — never coldkey/hotkey secrets.
-
-Capture check:
-
-```bash
-./violet/miner/smoke_contract.sh
-python scripts/run_qualification.py http://127.0.0.1:8091 --services asr,tts
-```
-
-### Miner access token (production auth)
-
-Avoices issues `MINER_ACCESS_TOKEN` after your hotkey proves registration on chain.
-Validators still reach `/health` without a token; product traffic from the router
-must present it when the miner enforces auth.
-
-**On ASRAPI (Render backend, not the frontend):** set `VIOLET_MINER_TOKEN_MASTER_KEY`
-on [phosai-backend-api-1.onrender.com](https://phosai-backend-api-1.onrender.com)
-(e.g. `openssl rand -hex 32`).
-
-**On the GPU host (after `btcli subnet register`):**
-
-```bash
-pip install -e ".[chain]"
-# Default API URL is the Render backend (not https://voices.phosaico.com)
-./violet/miner/fetch_access_token.sh test --write-env
-./violet/miner/start.sh test --no-follow   # reload sidecar with new .env
-```
-
-Or auto-fetch during bootstrap: `FETCH_MINER_TOKEN=1 ./violet/miner/bootstrap.sh test`
+1. [Choose your path](#choose-your-path)
+2. [Prerequisites checklist](#prerequisites-checklist)
+3. [GPU space detection](#gpu-space-detection-run-this-first)
+4. [Step-by-step setup](#step-by-step-setup)
+   - [Step 1 — System prerequisites](#step-1--system-prerequisites)
+   - [Step 2 — Clone the repository](#step-2--clone-the-repository)
+   - [Step 3 — Python environment](#step-3--python-environment)
+   - [Step 4 — Bittensor CLI](#step-4--bittensor-cli)
+   - [Step 5 — Wallet](#step-5--wallet)
+   - [Step 6 — Configure `.env`](#step-6--configure-env)
+   - [Step 7 — Install inference (ASR + TTS)](#step-7--install-inference-asr--tts)
+   - [Step 8 — Start the miner](#step-8--start-the-miner)
+   - [Step 9 — Verify locally](#step-9--verify-locally)
+   - [Step 10 — Register on the subnet](#step-10--register-on-the-subnet)
+   - [Step 11 — Announce your endpoint](#step-11--announce-your-endpoint)
+   - [Step 12 — Verify from the public internet](#step-12--verify-from-the-public-internet)
+5. [Reference](#reference)
+   - [API contract](#api-contract)
+   - [GPU deploy modes](#gpu-deploy-modes)
+   - [Access token (production)](#access-token-production)
+   - [GPU planning](#gpu-planning)
+   - [Capacity rules](#capacity-rules)
+   - [Day-2 operations](#day-2-operations)
+   - [Troubleshooting](#troubleshooting)
 
 ---
 
-## What you need before you start
+## Choose your path
 
-| Requirement | Why |
-|-------------|-----|
-| **NVIDIA GPU** (A100 / H100 / H200 class) | Real ASR/TTS inference |
-| **Bare GPU VM or WSL2** (Docker is the **host**) | TTS CUDA. Nested GPU jobs/`/.dockerenv` usually cannot allocate CUDA |
-| **Ubuntu 22.04+** (or similar Linux) | Install scripts target Debian/Ubuntu |
-| **Docker + Docker Compose** | Sidecar + inference containers |
-| **NVIDIA driver** | GPU must show in `nvidia-smi` |
-| **NVIDIA Container Toolkit** | Lets Docker containers use the GPU (`nvidia-ctk`) |
-| **Public IP or DNS** | Validators dial your miner on port **8091** |
-| **Python 3.10+** | Announce script, qualification, optional process-mode miner |
-| **TAO** in coldkey wallet | Subnet registration fee |
+| Path | When | Command |
+|------|------|---------|
+| **A — Bootstrap (recommended)** | Bare GPU VM; first-time setup | `./violet/miner/bootstrap.sh prod --gpu --no-follow` |
+| **B — Manual inference first** | You want STT/TTS up before sidecar | Steps 7 → 8 with `SKIP_INFERENCE_INSTALL=1` on second start |
+| **C — ASR only** | TTS CUDA gate fails (nested GPU job) | `MINER_SERVICES=asr ./violet/miner/bootstrap.sh prod --gpu` |
+| **D — Dev / NVML-only host** | CUDA blocked; smoke test only | `STT_FORCE_CPU=1` or `MINER_INFERENCE_DEPLOY=cpu` — **not for production mining** |
 
-**Ports on the host**
-
-| Port | Service |
-|------|---------|
-| **8091** | Miner sidecar (public — announce this) |
-| 9090 | ASR / etoil-api (local; proxied by sidecar) |
-| 8002 | TTS / Spark (local; proxied by sidecar) |
-
-### Network / NAT (Keenetic and similar routers)
-
-Validators dial **only** `MINER_PUBLIC_ENDPOINT` (TCP **8091**). Opening SSH (`22`) or HTTP (`80`/`443`) is **not** enough.
-
-- If a browser to `http://YOUR_PUBLIC_IP/` shows a **KeeneticOS** (or other) admin panel, WAN **80** is the router — do **not** put the miner on port 80.
-- Forward **WAN:8091 → VM_LAN_IP:8091** on the router (and allow **8091** in any cloud security group).
-- Checking from the miner host often fails due to **NAT hairpin**; verify from a second network:
-
-```bash
-curl -fsS http://YOUR_PUBLIC_IP:8091/health
-nc -vz YOUR_PUBLIC_IP 8091
-```
-
-Install scripts print this as the remaining manual step after local smoke passes.
-
----
-
-## GPU space detection (run this first)
-
-Before spending time on STT/TTS install, classify the host:
+**Always run first:**
 
 ```bash
 ./violet/miner/detect_gpu_space.sh
 ```
 
-| Class | Meaning | Deploy mode |
-|-------|---------|-------------|
-| `bare_gpu_ok` | Bare GPU VM — full CUDA in Docker | `compose` (default) |
-| `host_socket_gpu_ok` | GPU tenant with working `docker run --gpus` | `run` |
-| `shell_only_gpu` | CUDA in shell only — experimental | `run` |
-| `nvml_only` | `nvidia-smi` works, `cuCtxCreate` fails (999) | `cpu` fallback only |
-| `no_gpu` | No usable GPU | fix drivers / pick another offer |
+---
 
-Set in `.env` (or export):
+## Prerequisites checklist
+
+| Requirement | Why |
+|-------------|-----|
+| **NVIDIA GPU** (A100 / H100 / H200 class) | Real ASR/TTS inference |
+| **Bare GPU VM or WSL2** | Docker must be the **host** service — nested GPU jobs often block CUDA |
+| **Ubuntu 22.04+** | Install scripts target Debian/Ubuntu |
+| **Docker + Compose plugin** | Sidecar + inference containers |
+| **NVIDIA driver + Container Toolkit** | GPU inside Docker (`nvidia-ctk`) |
+| **Public IP or DNS** | Validators dial port **8091** (or your `MINER_PORT`) |
+| **Python 3.10+** | Announce, qualification |
+| **TAO** in coldkey | Subnet registration fee |
+| **`HF_TOKEN`** in `.env` | STT model pull (TTS image has models baked in) |
+
+**Ports**
+
+| Port | Service | Exposed publicly? |
+|------|---------|-------------------|
+| **8091** | Miner sidecar | **Yes** — set `MINER_PUBLIC_ENDPOINT` to this |
+| 9090 | ASR (etoil-api) | No — localhost / sidecar proxy only |
+| 8002 | TTS (Spark) | No — localhost / sidecar proxy only |
+
+**Network / NAT:** Forward **WAN:8091 → miner LAN IP:8091**. Validators do **not** use ports 22, 80, or 443. Verify from **outside** your LAN:
 
 ```bash
-MINER_INFERENCE_DEPLOY=auto   # default — picks compose | run | cpu from detect
-# MINER_INFERENCE_DEPLOY=compose   # docker-compose stacks (bare GPU VM)
-# MINER_INFERENCE_DEPLOY=run       # single-container docker run (GPU tenants)
-# MINER_INFERENCE_DEPLOY=cpu       # STT_FORCE_CPU dev smoke (not for mining)
+curl -fsS http://YOUR_PUBLIC_IP:8091/health
 ```
-
-**Run mode** (`inference_run_install.sh`): one `docker run` per service on a shared bridge network — no compose file. Use when the host Docker socket can allocate GPU but compose bridges misbehave.
-
-**NVML-only hosts** (nested GPU jobs like Datura/Lium spaces): neither compose nor run mode will use the H100 for inference. Move to a **bare GPU VM** (Chutes-style: K8s on bare metal, not DinD).
 
 ---
 
-## TTS host — read this before installing Spark
-
-`nvidia-smi` listing an H100 is **not** enough. Spark-TTS needs Docker to **allocate CUDA** (`cuCtxCreate` / `cuMemAlloc`). Nested GPU products (Datura/Lium-style jobs, `/.dockerenv`, Docker-in-Docker) often show the GPU and then fail with `CUDA-capable device(s) is/are busy or unavailable`. Installing TTS there hangs or crashes.
-
-| Host | TTS | ASR |
-|------|-----|-----|
-| Ubuntu VM / WSL2, Docker is the host | yes | yes |
-| Nested GPU job / space inside a container | **no** (`tts_install` aborts) | often yes |
-| Attested / confidential GPU (TEE) | avoid | avoid |
-
-`tts_install.sh` runs a **CUDA compute gate** before pulling/starting Spark. If the gate fails, install **stops** (it will not leave a crashing TTS container).
+## GPU space detection (run this first)
 
 ```bash
-# Must print ALLOC_OK on a TTS-capable host
-./violet/miner/tts_install.sh
+./violet/miner/detect_gpu_space.sh
 ```
 
-On a nested host, serve ASR only:
+| Class | Meaning | Action |
+|-------|---------|--------|
+| `bare_gpu_ok` | Full CUDA on bare VM | Default bootstrap / `MINER_INFERENCE_DEPLOY=compose` |
+| `host_socket_gpu_ok` | GPU tenant, Docker `--gpus` works | `MINER_INFERENCE_DEPLOY=run` |
+| `shell_only_gpu` | Shell CUDA only | Try `run` mode; may still fail |
+| `nvml_only` | `nvidia-smi` OK, `cuCtxCreate` 999 | **Use a bare GPU VM** — no GPU inference here |
+| `no_gpu` | No GPU | Fix drivers or change host |
+
+Set in `.env`:
 
 ```bash
-MINER_SERVICES=asr ./violet/miner/start.sh prod --gpu --no-follow
+MINER_INFERENCE_DEPLOY=auto   # default — auto-picks compose | run | cpu
 ```
 
-Do not use `TTS_FORCE_CPU=1` unless you accept multi-second TTS latency. `TTS_SKIP_CUDA_PROBE=1` is unsafe.
+See also [violet/miner/inference_run_install.sh](../violet/miner/inference_run_install.sh) for single-container `docker run` mode.
+
+> **TTS note:** `tts_install.sh` runs a CUDA compute gate (`ALLOC_OK` required). Nested GPU spaces fail here by design — use Path C (ASR only) or a bare VM.
 
 ---
 
-## Miner setup — numbered steps
+## Step-by-step setup
 
-### 1. Install system prerequisites
-
-On the GPU host:
+### Step 1 — System prerequisites
 
 ```bash
-# Docker (if missing)
+# Docker
 curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker "$USER"
 # log out and back in, or: newgrp docker
 
-# NVIDIA driver — use your cloud image or:
-# sudo ubuntu-drivers install && sudo reboot
-
-# Verify GPU driver
+# GPU driver — use cloud image or: sudo ubuntu-drivers install && sudo reboot
 nvidia-smi
 
-# NVIDIA Container Toolkit (required for GPU inside Docker)
-# Skip if nvidia-ctk is already installed.
+# NVIDIA Container Toolkit
 curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
   | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
   | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
   | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-sudo apt-get update
-sudo apt-get install -y nvidia-container-toolkit
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
 sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
 
-# Verify toolkit
-nvidia-ctk --version
 docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi
 ```
 
-The STT/TTS install scripts can also install the toolkit automatically if it is missing, but installing it here avoids surprises on first boot.
+STT/TTS install scripts can install the toolkit if missing, but doing it here avoids first-boot surprises.
 
 ---
 
-### 2. Clone the repository
+### Step 2 — Clone the repository
 
 ```bash
 git clone https://github.com/bateesatobi/cathedral-voice.git
@@ -217,231 +154,144 @@ cd cathedral-voice
 
 ---
 
-### 3. Create a Python environment and install dependencies
+### Step 3 — Python environment
 
-There is no `requirements.txt`. Dependencies live in **`pyproject.toml`**.
+No `requirements.txt` — install from **`pyproject.toml`**:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-
-# Core + Bittensor (needed for register / announce)
 pip install -U pip wheel
 pip install -e ".[chain]"
 ```
 
-Optional extras:
-
-```bash
-pip install -e ".[chain,dev]"    # + tests / qualification helpers
-```
+Optional: `pip install -e ".[chain,dev]"` for qualification helpers.
 
 ---
 
-### 4. Install Bittensor CLI (`btcli`)
-
-Usually installed with step 3 (`chain` extra). Verify:
+### Step 4 — Bittensor CLI
 
 ```bash
 btcli --version
 ```
 
-If missing:
-
-```bash
-pip install "bittensor>=11.0,<12"
-```
+If missing: `pip install "bittensor>=11.0,<12"`
 
 ---
 
-### 5. Create a Bittensor wallet
-
-Skip if you already have a coldkey + miner hotkey.
+### Step 5 — Wallet
 
 ```bash
-# Coldkey (once per operator)
 btcli wallet new_coldkey --wallet.name my-coldkey
-
-# Miner hotkey (one earning hotkey per coldkey on this subnet)
 btcli wallet new_hotkey --wallet.name my-coldkey --wallet.hotkey my-miner
-```
-
-Fund the coldkey with TAO (mainnet or testnet faucet for test).
-
-List wallets:
-
-```bash
 btcli wallet list
 ```
 
+Fund the coldkey with TAO. **One earning hotkey per coldkey** on this subnet.
+
 ---
 
-### 6. Configure `.env`
-
-Create the file:
+### Step 6 — Configure `.env`
 
 ```bash
 cp .env.example .env
 ```
 
-Set at least these keys before you run anything:
+Minimum keys:
 
 ```bash
-BT_NETWORK=test                 # or finney
+BT_NETWORK=finney              # or test
 BT_WALLET_NAME=my-coldkey
 BT_WALLET_HOTKEY=my-miner
 
-MINER_SERVICES=asr,tts          # use `asr` only if CUDA compute gate fails
+MINER_SERVICES=asr,tts         # or asr only if TTS CUDA gate fails
+MINER_INFERENCE_DEPLOY=auto
+
 MINER_PORT=8091
+MINER_PUBLIC_ENDPOINT=http://YOUR_PUBLIC_IP:8091
+MINER_ALLOW_HTTP=1             # if prod uses http:// not https://
+
 ASR_PORT=9090
 TTS_PORT=8002
-
-# The sidecar proxies to these local services
 MINER_ASR_UPSTREAM=http://host.docker.internal:9090
 MINER_TTS_UPSTREAM=http://host.docker.internal:8002
 
-# Set this to the REAL public URL that validators should dial.
-# Must match the public port you expose on the host/router.
-MINER_PUBLIC_ENDPOINT=http://YOUR_PUBLIC_IP:8091
-
-# Required for private / gated Hugging Face pulls used by STT.
-# TTS image has models baked in (no HF_TOKEN for tts_install).
-# Use plain ASCII only: hf_... (no smart quotes, no em-dashes, no trailing comments)
-HF_TOKEN=hf_...
+HF_TOKEN=hf_...                # plain ASCII; required for STT
 ```
 
-Mainnet uses:
-
-```bash
-BT_NETWORK=finney
-```
-
-Notes:
-
-- `MINER_PORT` is the miner sidecar listen port, and `start.sh` now uses it as-is when it is set.
-- `MINER_PUBLIC_ENDPOINT` is what gets announced on chain.
-- If you change the public port, change **both** `MINER_PORT` and `MINER_PUBLIC_ENDPOINT`.
-- If `MINER_PUBLIC_ENDPOINT` already includes a port, `start.sh` syncs `MINER_PORT` to that port.
-- Keep `ASR_PORT` and `TTS_PORT` private unless you intentionally publish them.
+- `MINER_PUBLIC_ENDPOINT` is what gets **announced on chain** — must match your public port-forward.
+- If the public port is not 8091, set **both** `MINER_PORT` and `MINER_PUBLIC_ENDPOINT` to that port.
+- Never put wallet secrets in `.env` — only wallet **names**.
 
 ---
 
-### 7. Set the miner public port
+### Step 7 — Install inference (ASR + TTS)
 
-Before you start the miner, choose the public port validators should dial.
+**Option 1 — let bootstrap install (Step 8):** skip this step; bootstrap calls STT/TTS when ports are down.
 
-Example using port `40202`:
-
-```bash
-sed -i '/^MINER_PORT=/d;/^MINER_PUBLIC_ENDPOINT=/d' .env
-cat >> .env <<'EOF'
-MINER_PORT=40202
-MINER_PUBLIC_ENDPOINT=http://YOUR_PUBLIC_IP:40202
-EOF
-```
-
-Verify:
+**Option 2 — manual install:**
 
 ```bash
-grep -E '^(MINER_PORT|MINER_PUBLIC_ENDPOINT)=' .env
-```
-
-If you use `prod` with plain HTTP instead of HTTPS, also set:
-
-```bash
-echo 'MINER_ALLOW_HTTP=1' >> .env
-```
-
-Then open that same port publicly in your firewall / router port-forward.
-
----
-
-### 8. Install GPU inference (ASR + TTS)
-
-Run from the repo root:
-
-```bash
-cd ~/cathedral-voice
 source .venv/bin/activate
-
-# Make HF_TOKEN visible to the install scripts as well as .env
 export HF_TOKEN="$(grep '^HF_TOKEN=' .env | cut -d= -f2-)"
 
-# ASR: speaches + etoil-api -> :9090
-./violet/miner/stt_install.sh
+./violet/miner/detect_gpu_space.sh
 
-# TTS: spark-tts-frontend -> :8002 (models baked in; no HF_TOKEN)
-# Aborts if Docker cannot allocate CUDA (nested GPU jobs).
+# ASR → :9090
+./violet/miner/stt_install.sh
+# or CPU dev: STT_FORCE_CPU=1 ./violet/miner/stt_install.sh
+
+# TTS → :8002 (CUDA gate must pass on GPU hosts)
 ./violet/miner/tts_install.sh
 ```
 
-What success looks like:
+Success checks:
 
-- STT: `Contract smoke: POST /transcribe -> 200`
-- TTS: CUDA gate prints `ALLOC_OK`, then `spark-tts-frontend` answers on `http://127.0.0.1:8002/`
+- STT: `Contract smoke: POST /transcribe → 200`
+- TTS: CUDA gate `ALLOC_OK`, then `http://127.0.0.1:8002/` responds
 
-If you want the sidecar to install them automatically, skip this step and use `bootstrap.sh` in step 9.
-
-Known issues we hit in practice:
-
-- If `stt_install.sh` shows Hugging Face / `UnicodeEncodeError` failures, your `HF_TOKEN` is missing or malformed. Re-check `.env` and re-export `HF_TOKEN`. TTS does not need `HF_TOKEN`.
-- If `tts_install.sh` stops at **CUDA compute gate**, this host cannot run TTS in Docker. Use `MINER_SERVICES=asr` here, and run TTS on a bare GPU VM or WSL.
-- CPU TTS (slow, not recommended):
-
-```bash
-TTS_FORCE_CPU=1 ./violet/miner/tts_install.sh
-```
-
-Optional TTS stream smoke test:
-
-```bash
-TTS_URL=http://127.0.0.1:8002 python violet/miner/tts_test_stream.py
-```
+**Run mode** (GPU tenants): `MINER_INFERENCE_DEPLOY=run ./violet/miner/inference_run_install.sh`
 
 ---
 
-### 9. Start the miner (sidecar + inference)
+### Step 8 — Start the miner
 
-Recommended: start everything with the checklist wrapper.
+Recommended — installs inference if needed, starts sidecar, runs smoke:
 
 ```bash
+./violet/miner/detect_gpu_space.sh
 MINER_SERVICES=asr,tts ./violet/miner/bootstrap.sh prod --gpu --no-follow
 ```
 
-If STT/TTS are already running and healthy, start only the sidecar:
+Inference already running:
 
 ```bash
 MINER_SERVICES=asr,tts SKIP_INFERENCE_INSTALL=1 ./violet/miner/start.sh prod --gpu --no-follow
 ```
 
-When prompted, enter your public IP or DNS.
+When prompted, enter your **public IP or DNS** (or set `MINER_PUBLIC_ENDPOINT` in `.env` and use `SKIP_ENDPOINT_PROMPT=1`).
 
-- If you enter only a host, `start.sh` appends `MINER_PORT`.
-- If your public port is not `8091`, set `MINER_PORT` and `MINER_PUBLIC_ENDPOINT` first in `.env`.
-
-The sidecar proxies:
-
-- ASR → etoil-api (`MINER_ASR_UPSTREAM`, default `:9090`)
-- TTS → Spark (`MINER_TTS_UPSTREAM`, default `:8002`)
-
-Open `MINER_PORT` publicly in your cloud security group / firewall so validators can reach you.  
-On home/office routers (Keenetic, etc.), add an explicit port-forward — see [Network / NAT](#network--nat-keenetic-and-similar-routers) above.
-
-`bootstrap.sh` ends with an **admission checklist** (local smoke, wallet, public-port hint, announce dry-run). Optional qualification:
+Optional qualification during bootstrap:
 
 ```bash
 BOOTSTRAP_QUALIFY=1 ./violet/miner/bootstrap.sh prod --gpu --no-follow
 ```
 
----
-
-### 10. Verify locally (before spending TAO on chain)
+Optional prod access token (after register):
 
 ```bash
-# Full validator-facing contract on the public miner port (+ local upstreams)
+FETCH_MINER_TOKEN=1 ./violet/miner/bootstrap.sh prod --gpu --no-follow
+```
+
+---
+
+### Step 9 — Verify locally
+
+Run **before** spending TAO on registration:
+
+```bash
 ./violet/miner/smoke_contract.sh
 
-# Spark often 404s on /health — speech stream is the TTS readiness check
 curl -fsS http://127.0.0.1:9090/health
 curl -sS -o /dev/null -w '%{http_code}\n' -H 'Content-Type: application/json' \
   -d '{"text":"hi","speaker_id":"eng_female_1","temperature":0.7}' \
@@ -449,156 +299,180 @@ curl -sS -o /dev/null -w '%{http_code}\n' -H 'Content-Type: application/json' \
 
 curl -fsS "http://127.0.0.1:${MINER_PORT:-8091}/health" | python3 -m json.tool | head -40
 curl -fsS "http://127.0.0.1:${MINER_PORT:-8091}/capacity" | python3 -m json.tool | head -40
-curl -fsS "http://127.0.0.1:${MINER_PORT:-8091}/violet/info" | python3 -m json.tool | head -40
 
-# Qualification suite (ASR + TTS contract checks)
 python scripts/run_qualification.py "http://127.0.0.1:${MINER_PORT:-8091}" --services asr,tts
 ```
 
-Expect `capacity_units > 0` (e.g. H100 → 2.4) and qualification **All tests passed**.  
-Fix any failures before registering.
+Expect `capacity_units > 0` and qualification **All tests passed**.
 
 ---
 
-### 11. Register on the subnet
+### Step 10 — Register on the subnet
 
-Do this only after the miner passes local smoke.
+Only after Step 9 passes.
 
-**Testnet (netuid 292):**
+**Testnet (292):**
 
 ```bash
 btcli subnet register --netuid 292 \
-  --wallet.name my-coldkey \
-  --wallet.hotkey my-miner \
+  --wallet.name my-coldkey --wallet.hotkey my-miner \
   --subtensor.network test
 ```
 
-**Mainnet (netuid 39):**
+**Mainnet (39):**
 
 ```bash
 btcli subnet register --netuid 39 \
-  --wallet.name my-coldkey \
-  --wallet.hotkey my-miner \
+  --wallet.name my-coldkey --wallet.hotkey my-miner \
   --subtensor.network finney
 ```
 
-Confirm registration:
-
 ```bash
-btcli wallet overview --wallet.name my-coldkey --subtensor.network test     # or finney
+btcli wallet overview --wallet.name my-coldkey --subtensor.network finney
 ```
 
 ---
 
-### 12. Announce your public endpoint on chain
+### Step 11 — Announce your endpoint
 
-Validators discover you from the **commitment**, not from Docker ports alone.
-
-Ensure `.env` has the exact public URL and port that the internet can reach:
-
-```bash
-MINER_PORT=8091
-MINER_PUBLIC_ENDPOINT=http://YOUR_PUBLIC_IP:8091
-```
-
-If you use another public port, announce that exact port instead:
-
-```bash
-MINER_PORT=9001
-MINER_PUBLIC_ENDPOINT=http://YOUR_PUBLIC_IP:9001
-```
-
-Dry-run (no transaction):
+Validators use the **on-chain commitment**, not Docker ports alone.
 
 ```bash
 python scripts/announce_endpoint.py --dry-run
-```
-
-Publish:
-
-```bash
 python scripts/announce_endpoint.py
 ```
 
-You can override the endpoint one time without editing `.env`:
+One-time override:
 
 ```bash
-python scripts/announce_endpoint.py --endpoint http://YOUR_PUBLIC_IP:9001
+python scripts/announce_endpoint.py --endpoint http://YOUR_PUBLIC_IP:8091
 ```
 
-Inspect all announcements on the subnet:
+Inspect subnet announcements:
 
 ```bash
 python scripts/announce_endpoint.py --show
 ```
 
-The miner process also re-announces when your endpoint or GPU inventory changes.
-
 ---
 
-### 13. Verify from outside the host
+### Step 12 — Verify from the public internet
 
-From another machine (or phone off Wi‑Fi):
+From another machine or phone (off your Wi‑Fi):
 
 ```bash
 curl -fsS http://YOUR_PUBLIC_IP:8091/health
 curl -fsS http://YOUR_PUBLIC_IP:8091/capacity
 ```
 
-If this fails, fix firewall / security group before expecting validator probes.
-
-If your public port is not `8091`, replace `8091` above with your actual `MINER_PORT`.
+If this fails, fix firewall / security group / router port-forward before expecting validator probes.
 
 ---
 
-### 14. Day-2 operations
+## Reference
+
+### API contract
+
+You announce **one** URL (`MINER_PUBLIC_ENDPOINT`). The sidecar proxies internal ASR/TTS.
+
+| Method | Path | Required | Purpose |
+|--------|------|----------|---------|
+| GET | `/health` | yes | Reachability, services, upstreams |
+| GET | `/capacity` | yes | GPU inventory → Capacity score |
+| GET | `/violet/info` | yes | Hotkey, uid, services |
+| POST | `/transcribe` | if ASR | Batch ASR |
+| WS | `/realtime/transcribe` | if ASR | Streaming ASR |
+| POST | `/v1/audio/speech/stream` | if TTS | TTS |
+| GET | `/v1/voices` | optional | Voice catalogue |
+
+**On-chain requirements for emissions:**
+
+1. Registered UID for your hotkey  
+2. Announced `MINER_PUBLIC_ENDPOINT`  
+3. Public TCP **8091** (or your `MINER_PORT`) reachable  
+4. Sidecar running with wallet loaded (`/health` shows hotkey)
+
+---
+
+### GPU deploy modes
+
+| `MINER_INFERENCE_DEPLOY` | Installs via | Use when |
+|--------------------------|--------------|----------|
+| `auto` | bootstrap picks | Default |
+| `compose` | `stt_install.sh` + compose | Bare GPU VM |
+| `run` | `inference_run_install.sh` | GPU tenant, host docker.sock |
+| `cpu` | `STT_FORCE_CPU=1` | NVML-only dev smoke |
+
+---
+
+### Access token (production)
+
+Product traffic from the Avoices router may require `MINER_ACCESS_TOKEN`. Validators reach `/health` without it.
 
 ```bash
-./violet/miner/start.sh status          # sidecar + ASR/TTS health
-./violet/miner/start.sh logs            # follow sidecar logs
-./violet/miner/start.sh stop            # stop sidecar only
-./violet/miner/start.sh stop-all        # sidecar + ASR + TTS
-
-# Re-announce after IP change
-python scripts/announce_endpoint.py
+./violet/miner/fetch_access_token.sh test --write-env
+./violet/miner/start.sh test --no-follow
 ```
+
+Backend ops: set `VIOLET_MINER_TOKEN_MASTER_KEY` on the ASRAPI Render service.
 
 ---
 
-## GPU planning (reference)
+### GPU planning
 
-| Mode | When | GPUs |
-|------|------|------|
-| Solo ASR | `stt_install.sh` alone | All → STT |
-| Solo TTS | `tts_install.sh` alone | Spark TTS (`spark-tts-frontend`) |
-| Both | default `start.sh` | Split; no idle card |
+| Mode | When | GPU assignment |
+|------|------|----------------|
+| Solo ASR | `stt_install.sh` alone | All GPUs → STT |
+| Solo TTS | `tts_install.sh` alone | All GPUs → TTS |
+| Both | default `start.sh` | Split across STT/TTS |
 
 Details: [MINER_GPU_BOOTSTRAP_REPORT.md](./MINER_GPU_BOOTSTRAP_REPORT.md)
 
 ---
 
-## Rules (earn Capacity)
+### Capacity rules
 
-1. Only **A100 40/80, H100 80, H100 NVL, H200** count toward Capacity.
-2. **One earning hotkey per coldkey** on this subnet.
-3. Do not over-advertise concurrency — sidecar enforces `MINER_MAX_CONCURRENT_*` (auto-tuned from GPU count when `0`).
+1. Only **A100 40/80, H100 80, H100 NVL, H200** count toward Capacity.  
+2. **One earning hotkey per coldkey** on this subnet.  
+3. Do not over-advertise concurrency — sidecar enforces `MINER_MAX_CONCURRENT_*` (auto-tuned when `0`).
 
 ---
 
-## Troubleshooting
+### Day-2 operations
 
-| Symptom | Check |
-|---------|--------|
-| `/health` OK locally, validators can't reach you | Public IP, port **8091**, `MINER_PUBLIC_ENDPOINT`, announce; Keenetic must forward **8091** (not just 22/80/443) |
-| Port 80 shows router admin UI | Do not bind miner to 80; forward WAN:8091 → VM:8091 |
-| ASR fails | `docker compose -f violet/miner/stt-stack/docker-compose.yml logs` |
-| ASR `/health` OK, `/transcribe` 500, speaches log `DevicesUnavailable` | Nested Docker — no CUDA alloc. Run `./violet/miner/detect_gpu_space.sh` |
-| `cuCtxCreate 999` / NVML-only H100 | Not fixable in software — bare GPU VM required for GPU inference |
-| STT install stopped at CUDA compute gate | Same as TTS gate — run STT on bare GPU VM/WSL |
-| `mount ... ./audio ... no such file or directory` | Old compose used a bind mount; pull latest `stt_install.sh` (uses `stt-audio` volume) |
-| etoil `EXTERNAL_API_URL` / crash-loop on start | Set `EXTERNAL_API_URL=http://speaches:8000` in compose (fixed in latest `stt_install.sh`) |
-| TTS fails / OOM on 1 GPU | Both stacks share GPU 0 — see GPU report; consider ASR-only or TTS-only host |
-| TTS install stopped at CUDA compute gate | Nested Docker / no CUDA alloc. Use `MINER_SERVICES=asr` or a bare GPU VM/WSL |
-| TTS crash-loop / DevicesUnavailable | Same as CUDA gate — do not force-install on that host |
-| `btcli` / announce errors | `BT_NETWORK`, wallet path, TAO balance, netuid **39** vs **292** |
-| No emissions | Registered? Announced? GPUs in allowed tier? Passing qualification? |
+```bash
+./violet/miner/start.sh status
+./violet/miner/start.sh logs
+./violet/miner/start.sh stop          # sidecar only
+./violet/miner/start.sh stop-all      # sidecar + ASR + TTS
+
+python scripts/announce_endpoint.py   # after IP change
+```
+
+---
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| Validators can't reach you | Public IP, `MINER_PUBLIC_ENDPOINT`, port-forward **8091**, run `announce_endpoint.py` |
+| Port 80 shows router admin | Do not use port 80 for miner; forward **8091** |
+| `./violet/miner/detect_gpu_space.sh` → `nvml_only` | Bare GPU VM required for H100 GPU inference |
+| ASR `/transcribe` 500, `DevicesUnavailable` | Same — nested host; try `STT_FORCE_CPU=1` for dev only |
+| TTS install stops at CUDA gate | `MINER_SERVICES=asr` or move to bare VM |
+| HF / `UnicodeEncodeError` on STT | Fix `HF_TOKEN` in `.env` (plain ASCII `hf_...`) |
+| TTS OOM on 1 GPU | ASR+TTS share GPU 0 — use split hosts or `MINER_SERVICES=asr` |
+| No emissions | Registered? Announced? Allowed GPU tier? Qualification passing? |
+| `btcli` / announce errors | Check `BT_NETWORK`, wallet path, TAO, netuid **39** vs **292** |
+
+Logs:
+
+```bash
+docker compose -f violet/miner/stt-stack/docker-compose.yml logs
+docker logs -f spark-tts-frontend
+docker logs -f violet-miner-violet-miner-1
+```
+
+---
+
+**Next:** [README.md](../README.md) · [Validator guide](./VALIDATOR_GUIDE.md) · [Incentive model](./INCENTIVE.md)
