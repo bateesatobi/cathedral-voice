@@ -447,16 +447,17 @@ ensure_inference_stacks() {
   plan_gpu_devices "$plan_mode"
   export GPU_PLAN_LOCKED=1
   deploy="$(resolve_inference_deploy)"
-  echo "==> GPU plan mode=${plan_mode} count=${GPU_COUNT:-?} STT=[${STT_GPU_DEVICES:-}] TTS=[${TTS_GPU_DEVICES:-}]"
+  echo "==> GPU plan mode=${plan_mode} physical=${GPU_COUNT:-?} accepted=${GPU_ACCEPTED_COUNT:-?} STT=[${STT_GPU_DEVICES:-}] TTS=[${TTS_GPU_DEVICES:-}]"
+  print_gpu_inventory | sed 's/^/==> /'
   echo "==> inference deploy mode=${deploy} (MINER_INFERENCE_DEPLOY=${MINER_INFERENCE_DEPLOY:-auto})"
   if [[ "${deploy}" == "cpu" ]]; then
     echo "==> NVML-only / CPU fallback — GPU inference not available on this host"
     echo "    Run ./violet/miner/detect_gpu_space.sh for details"
   fi
-  if [[ "${GPU_COUNT:-0}" -ge 1 ]]; then
-    assert_no_idle_gpus "${GPU_COUNT}" \
+  if [[ -n "${GPU_ACCEPTED_INDICES:-}" ]]; then
+    assert_no_idle_accepted_gpus "${GPU_ACCEPTED_INDICES}" \
       "${STT_GPU_DEVICES:-}" "${TTS_GPU_DEVICES:-}" \
-      || echo "WARN: idle GPU detected in plan" >&2
+      || echo "WARN: idle allowed GPU detected in plan" >&2
   fi
 
   if services_want_asr; then

@@ -32,7 +32,7 @@ Then register, announce, and verify from the public internet — see [MINER_GUID
 
 | Script | Purpose |
 |--------|---------|
-| [detect_gpu_space.sh](./detect_gpu_space.sh) | Bare GPU vs NVML-only nested host — run **first** |
+| [detect_gpu_space.sh](./detect_gpu_space.sh) | Bare GPU vs NVML-only nested host — run **first**; prints Capacity inventory |
 | [bootstrap.sh](./bootstrap.sh) | Recommended bring-up: GPU check → STT/TTS → sidecar → smoke |
 | [start.sh](./start.sh) | Start/stop/status/logs; `stop-all` tears down inference too |
 | [stt_install.sh](./stt_install.sh) | ASR stack (speaches + etoil-api → `:9090`) |

@@ -14,6 +14,8 @@ calls for TEE or challenge-response VRAM proofs in a later version.
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import logging
 import os
 import shutil
@@ -89,7 +91,10 @@ def parse_nvidia_smi(output: str) -> Tuple[List[GpuInfo], List[str]]:
         line = line.strip()
         if not line:
             continue
-        parts = [part.strip() for part in line.split(",")]
+        try:
+            parts = [part.strip() for part in next(csv.reader(io.StringIO(line)))]
+        except csv.Error:
+            parts = [part.strip() for part in line.split(",")]
         if len(parts) < 3:
             continue
 

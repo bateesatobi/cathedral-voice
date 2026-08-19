@@ -2,20 +2,160 @@
 # Shared GPU planning for cathedral-voice miner install scripts.
 #
 # Modes (plan_gpu_devices <mode>):
-#   stt  — STT alone → ALL host GPUs (none left idle)
-#   tts  — TTS alone → ALL host GPUs
-#   both — STT + TTS on same host → partition so every GPU is assigned
-#          N=1 → share GPU 0
-#          N>=2 → first half STT, second half TTS (covers all indices)
+#   stt  — STT alone → ALL accepted host GPUs (none of those left idle)
+#   tts  — TTS alone → ALL accepted host GPUs
+#   both — STT + TTS on same host → partition accepted cards
+#
+# Unlisted SKUs (3080, T4, …) cannot run install/start unless GPU_ALLOW_UNLISTED=1.
+# Mixed hosts: only Capacity-allowed indices are planned.
 #
 # Overrides (comma-separated): STT_GPU_DEVICES / TTS_GPU_DEVICES
 
+# Repo root when this file lives at violet/miner/gpu_env.sh
+_violet_repo_root() {
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  cd "${here}/../.." && pwd
+}
+
+# Physical GPU count only. Do not use `nvidia-smi -L` — MIG slices add extra lines.
 detect_gpu_count() {
   if ! command -v nvidia-smi >/dev/null 2>&1; then
     echo 0
     return 0
   fi
-  nvidia-smi -L 2>/dev/null | wc -l | tr -d ' '
+  nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null \
+    | grep -cE '^[0-9]+' || true
+}
+
+# Classify each card with the same rules as Capacity scoring (Python).
+# Falls back to a raw nvidia-smi listing if the package import fails.
+print_gpu_inventory() {
+  local root
+  root="$(_violet_repo_root)"
+  if command -v python3 >/dev/null 2>&1; then
+    if PYTHONPATH="${root}${PYTHONPATH:+:$PYTHONPATH}" \
+      python3 -m violet.miner.gpu_inventory --human 2>/dev/null; then
+      return 0
+    fi
+  fi
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    echo "GPUs (raw nvidia-smi; Capacity classifier unavailable):"
+    nvidia-smi --query-gpu=index,name,memory.total,uuid,compute_cap,driver_version \
+      --format=csv 2>/dev/null || nvidia-smi -L 2>/dev/null || true
+    return 0
+  fi
+  echo "GPUs: nvidia-smi not found"
+  return 0
+}
+
+export_gpu_inventory_env() {
+  local root
+  root="$(_violet_repo_root)"
+  command -v python3 >/dev/null 2>&1 || return 1
+  PYTHONPATH="${root}${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m violet.miner.gpu_inventory --env
+}
+
+load_gpu_inventory_env() {
+  local raw
+  raw="$(export_gpu_inventory_env)" || return 1
+  eval "$raw"
+}
+
+gpu_check_allowed_tiers() {
+  local root rc
+  root="$(_violet_repo_root)"
+  command -v python3 >/dev/null 2>&1 || return 1
+  PYTHONPATH="${root}${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m violet.miner.gpu_inventory --check
+}
+
+# Fail closed: no Capacity-allowed GPU → miner scripts must not proceed.
+require_allowed_gpus() {
+  local root rc
+  if [[ "${GPU_ALLOW_UNLISTED:-0}" == "1" ]]; then
+    echo "[gpu] GPU_ALLOW_UNLISTED=1 — skipping Capacity tier gate (not for mining)." >&2
+    return 0
+  fi
+  root="$(_violet_repo_root)"
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "[gpu] python3 is required to classify GPUs before install." >&2
+    return 1
+  fi
+  if ! PYTHONPATH="${root}${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m violet.miner.gpu_inventory --check; then
+    echo "[gpu] REFUSED: this host has no GPU on the subnet allowlist." >&2
+    print_gpu_inventory >&2 || true
+    echo "[gpu] Install/start scripts will not run on unlisted cards." >&2
+    echo "[gpu] Allowed tiers:" >&2
+    PYTHONPATH="${root}${PYTHONPATH:+:$PYTHONPATH}" \
+      python3 -m violet.miner.gpu_inventory --list-tiers >&2 || true
+    echo "[gpu] Local CPU smoke only: GPU_ALLOW_UNLISTED=1 (earns no Capacity)." >&2
+    return 1
+  fi
+  load_gpu_inventory_env || return 1
+  if [[ -n "${GPU_REJECTED_INDICES:-}" ]]; then
+    echo "[gpu] Unlisted GPU indices will not be used: ${GPU_REJECTED_INDICES}" >&2
+  fi
+  return 0
+}
+
+gpu_csv_slice() {
+  local csv="$1" start="${2:-0}" end="${3:-}"
+  local -a arr=()
+  local i out=()
+  [[ -z "$csv" ]] && { echo ""; return 0; }
+  IFS=',' read -r -a arr <<< "$csv"
+  if [[ -z "$end" ]]; then
+    end=$((${#arr[@]} - 1))
+  fi
+  if (( ${#arr[@]} < 1 || start > end )); then
+    echo ""
+    return 0
+  fi
+  for ((i = start; i <= end; i++)); do
+    out+=("${arr[i]}")
+  done
+  local IFS=,
+  echo "${out[*]}"
+}
+
+# Every accepted index must appear in STT∪TTS (rejected cards may stay idle).
+assert_no_idle_accepted_gpus() {
+  local accepted="$1" stt="$2" tts="$3"
+  local id found
+  [[ -z "$accepted" ]] && return 0
+  IFS=',' read -r -a ids <<< "$accepted"
+  for id in "${ids[@]}"; do
+    id="$(echo "$id" | tr -d '[:space:]')"
+    [[ -z "$id" ]] && continue
+    found=0
+    [[ ",${stt}," == *",${id},"* ]] && found=1
+    [[ ",${tts}," == *",${id},"* ]] && found=1
+    if [[ $found -eq 0 ]]; then
+      echo "accepted GPU ${id} would be idle (STT=${stt} TTS=${tts})" >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
+assert_devices_are_accepted() {
+  local devices="$1" label="${2:-GPU}"
+  local id
+  [[ -z "$devices" ]] && return 0
+  [[ "${GPU_ALLOW_UNLISTED:-0}" == "1" ]] && return 0
+  IFS=',' read -r -a ids <<< "$devices"
+  for id in "${ids[@]}"; do
+    id="$(echo "$id" | tr -d '[:space:]')"
+    [[ -z "$id" ]] && continue
+    if [[ ",${GPU_ACCEPTED_INDICES}," != *",${id},"* ]]; then
+      echo "${label} index ${id} is not on the Capacity allowlist (accepted=${GPU_ACCEPTED_INDICES:-none})" >&2
+      return 1
+    fi
+  done
+  return 0
 }
 
 gpu_index_list() {
@@ -71,13 +211,29 @@ assert_no_idle_gpus() {
 #   STT_GPU_DEVICES_OVERRIDE=0,1 TTS_GPU_DEVICES_OVERRIDE=2,3
 plan_gpu_devices() {
   local mode="${1:-both}"
-  local n
-  n="$(detect_gpu_count)"
-  GPU_COUNT="$n"
-  export GPU_COUNT
+  local n accepted
+
+  require_allowed_gpus || return 1
+  if ! load_gpu_inventory_env; then
+    if [[ "${GPU_ALLOW_UNLISTED:-0}" == "1" ]]; then
+      n="$(detect_gpu_count)"
+      GPU_COUNT="$n"
+      GPU_ACCEPTED_INDICES="$(gpu_index_list "$n")"
+      GPU_ACCEPTED_COUNT="$n"
+      export GPU_COUNT GPU_ACCEPTED_INDICES GPU_ACCEPTED_COUNT
+    else
+      return 1
+    fi
+  fi
+
+  accepted="${GPU_ACCEPTED_INDICES:-}"
+  n="$(gpu_device_count "$accepted")"
+  export GPU_COUNT GPU_ACCEPTED_INDICES GPU_ACCEPTED_COUNT
 
   if [[ "${GPU_PLAN_LOCKED:-0}" == "1" ]] \
     && [[ -n "${STT_GPU_DEVICES:-}${TTS_GPU_DEVICES:-}" ]]; then
+    assert_devices_are_accepted "${STT_GPU_DEVICES:-}" STT || return 1
+    assert_devices_are_accepted "${TTS_GPU_DEVICES:-}" TTS || return 1
     export STT_GPU_DEVICES TTS_GPU_DEVICES
     return 0
   fi
@@ -85,24 +241,26 @@ plan_gpu_devices() {
   if [[ -n "${STT_GPU_DEVICES_OVERRIDE:-}" || -n "${TTS_GPU_DEVICES_OVERRIDE:-}" ]]; then
     case "$mode" in
       stt)
-        STT_GPU_DEVICES="${STT_GPU_DEVICES_OVERRIDE:-${NVIDIA_VISIBLE_DEVICES:-$(gpu_index_list "$n")}}"
+        STT_GPU_DEVICES="${STT_GPU_DEVICES_OVERRIDE:-${NVIDIA_VISIBLE_DEVICES:-$accepted}}"
         TTS_GPU_DEVICES=""
         ;;
       tts)
-        TTS_GPU_DEVICES="${TTS_GPU_DEVICES_OVERRIDE:-${NVIDIA_VISIBLE_DEVICES:-$(gpu_index_list "$n")}}"
+        TTS_GPU_DEVICES="${TTS_GPU_DEVICES_OVERRIDE:-${NVIDIA_VISIBLE_DEVICES:-$accepted}}"
         STT_GPU_DEVICES=""
         ;;
       *)
         STT_GPU_DEVICES="${STT_GPU_DEVICES_OVERRIDE:-}"
         TTS_GPU_DEVICES="${TTS_GPU_DEVICES_OVERRIDE:-}"
         if [[ -z "$STT_GPU_DEVICES" && "$n" -ge 1 ]]; then
-          STT_GPU_DEVICES="$(gpu_index_list "$n")"
+          STT_GPU_DEVICES="$accepted"
         fi
         if [[ -z "$TTS_GPU_DEVICES" && "$n" -ge 1 ]]; then
-          TTS_GPU_DEVICES="$(gpu_index_list "$n")"
+          TTS_GPU_DEVICES="$accepted"
         fi
         ;;
     esac
+    assert_devices_are_accepted "${STT_GPU_DEVICES:-}" STT || return 1
+    assert_devices_are_accepted "${TTS_GPU_DEVICES:-}" TTS || return 1
     export STT_GPU_DEVICES TTS_GPU_DEVICES
     return 0
   fi
@@ -116,26 +274,25 @@ plan_gpu_devices() {
 
   case "$mode" in
     stt)
-      # Solo STT: every GPU works ASR — none idle.
-      STT_GPU_DEVICES="$(gpu_index_list "$n")"
+      STT_GPU_DEVICES="$accepted"
       TTS_GPU_DEVICES=""
       ;;
     tts)
-      TTS_GPU_DEVICES="$(gpu_index_list "$n")"
+      TTS_GPU_DEVICES="$accepted"
       STT_GPU_DEVICES=""
       ;;
     both|*)
       if (( n == 1 )); then
-        STT_GPU_DEVICES="0"
-        TTS_GPU_DEVICES="0"
+        STT_GPU_DEVICES="$accepted"
+        TTS_GPU_DEVICES="$accepted"
       else
-        local mid=$(( (n + 1) / 2 ))  # STT gets ceil(N/2), TTS the rest
+        local mid=$(( (n + 1) / 2 ))
         if (( mid < 1 )); then mid=1; fi
         if (( mid >= n )); then mid=$((n - 1)); fi
-        STT_GPU_DEVICES="$(gpu_index_list "$n" 0 $((mid - 1)))"
-        TTS_GPU_DEVICES="$(gpu_index_list "$n" "$mid" $((n - 1)))"
-        assert_no_idle_gpus "$n" "$STT_GPU_DEVICES" "$TTS_GPU_DEVICES" \
-          || { echo "internal GPU plan left a card idle" >&2; exit 1; }
+        STT_GPU_DEVICES="$(gpu_csv_slice "$accepted" 0 $((mid - 1)))"
+        TTS_GPU_DEVICES="$(gpu_csv_slice "$accepted" "$mid" $((n - 1)))"
+        assert_no_idle_accepted_gpus "$accepted" "$STT_GPU_DEVICES" "$TTS_GPU_DEVICES" \
+          || { echo "internal GPU plan left an allowed card idle" >&2; return 1; }
       fi
       ;;
   esac

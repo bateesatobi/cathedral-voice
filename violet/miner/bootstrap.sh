@@ -212,7 +212,13 @@ export SKIP_ENDPOINT_PROMPT="${SKIP_ENDPOINT_PROMPT:-0}"
 
 if [[ -x "${SCRIPT_DIR}/detect_gpu_space.sh" ]]; then
   log "GPU space preflight"
-  if ! "${SCRIPT_DIR}/detect_gpu_space.sh"; then
+  detect_rc=0
+  "${SCRIPT_DIR}/detect_gpu_space.sh" || detect_rc=$?
+  if [[ "$detect_rc" -eq 4 ]]; then
+    err "No Capacity-allowed GPU — bootstrap will not install on this host"
+    exit 1
+  fi
+  if [[ "$detect_rc" -ne 0 ]]; then
     warn "GPU space check reported issues — see above before expecting GPU inference"
   fi
   echo

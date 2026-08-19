@@ -242,6 +242,7 @@ if command -v nvidia-smi &>/dev/null; then
     GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1 || echo "NVIDIA GPU")
     DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n1 || echo "Unknown")
     log_info "NVIDIA GPU detected: ${GPU_NAME} (Driver: ${DRIVER_VER})"
+    print_gpu_inventory | while IFS= read -r line; do log_info "  ${line}"; done
 elif lspci 2>/dev/null | grep -i nvidia >/dev/null; then
     log_info "NVIDIA GPU hardware detected via lspci."
 else

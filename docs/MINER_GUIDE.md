@@ -63,7 +63,7 @@ Leave `VIOLET_NETUID` blank — the repo picks **39** or **292** from `BT_NETWOR
 
 | Requirement | Why |
 |-------------|-----|
-| **NVIDIA GPU** (A100 / H100 / H200 class) | Real ASR/TTS inference |
+| **NVIDIA GPU** (RTX 3090 through GB200 / B200 / GH200 / H200) | Real ASR/TTS inference; only listed tiers earn Capacity |
 | **Bare GPU VM or WSL2** | Docker must be the **host** service — nested GPU jobs often block CUDA |
 | **Ubuntu 22.04+** | Install scripts target Debian/Ubuntu |
 | **Docker + Compose plugin** | Sidecar + inference containers |
@@ -432,7 +432,7 @@ Details: [MINER_GPU_BOOTSTRAP_REPORT.md](./MINER_GPU_BOOTSTRAP_REPORT.md)
 
 ### Capacity rules
 
-1. Only **A100 40/80, H100 80, H100 NVL, H200** count toward Capacity.  
+1. Capacity counts **RTX 3090 and up** through **H200 / GH200 / B200 / GB200** (see [INCENTIVE.md](./INCENTIVE.md)). **Install and start scripts refuse to run** if the host has no card on that list (3080, T4, …). Mixed boxes use only the allowed indices. Dev bypass: `GPU_ALLOW_UNLISTED=1`.  
 2. **One earning hotkey per coldkey** on this subnet.  
 3. Do not over-advertise concurrency — sidecar enforces `MINER_MAX_CONCURRENT_*` (auto-tuned when `0`).
 

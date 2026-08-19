@@ -15,7 +15,7 @@
 #   0  bare_gpu_ok or host_socket_gpu_ok — GPU inference viable
 #   1  nvml_only — H100 visible but CUDA compute blocked (move to bare VM)
 #   2  shell_only_gpu — shell CUDA works, docker --gpus may need run mode
-#   3  no_gpu
+#   4  no Capacity-allowed GPU (RTX 3090–GB200 list) — install scripts refuse
 #
 set -euo pipefail
 
@@ -23,6 +23,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_LOG_PREFIX="detect_gpu"
 # shellcheck source=install_lib.sh
 source "${SCRIPT_DIR}/install_lib.sh"
+# shellcheck source=gpu_env.sh
+source "${SCRIPT_DIR}/gpu_env.sh"
 
 JSON=0
 QUIET=0
@@ -55,28 +57,71 @@ case "$GPU_SPACE_CLASS" in
   *) exit_code=3 ;;
 esac
 
+GPU_TIER_OK=1
+GPU_TIER_CHECK_RC=0
+if [[ "${GPU_ALLOW_UNLISTED:-0}" != "1" ]]; then
+  gpu_check_allowed_tiers || GPU_TIER_CHECK_RC=$?
+  if [[ "$GPU_TIER_CHECK_RC" -eq 2 ]]; then
+    GPU_TIER_OK=0
+    exit_code=4
+  elif [[ "$GPU_TIER_CHECK_RC" -eq 3 ]]; then
+    GPU_TIER_OK=0
+    if [[ "$exit_code" -eq 0 ]]; then
+      exit_code=4
+    fi
+  elif [[ "$GPU_TIER_CHECK_RC" -ne 0 ]]; then
+    GPU_TIER_OK=0
+    exit_code=4
+  fi
+fi
+
 if (( QUIET )); then
-  echo "$GPU_SPACE_CLASS"
+  if [[ "$GPU_TIER_CHECK_RC" -eq 2 ]]; then
+    echo "no_allowed_tier"
+  else
+    echo "$GPU_SPACE_CLASS"
+  fi
   exit "$exit_code"
 fi
 
 if (( RECOMMEND )); then
-  echo "$GPU_SPACE_DEPLOY"
+  if [[ "$GPU_TIER_CHECK_RC" -eq 2 ]]; then
+    echo "refused"
+  else
+    echo "$GPU_SPACE_DEPLOY"
+  fi
   exit "$exit_code"
 fi
 
 if (( JSON )); then
   export GPU_SPACE_CLASS GPU_SPACE_DEPLOY
+  GPU_INVENTORY_JSON=""
+  if command -v python3 >/dev/null 2>&1; then
+    GPU_INVENTORY_JSON="$(
+      PYTHONPATH="${SCRIPT_DIR}/../..${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m violet.miner.gpu_inventory --json 2>/dev/null || true
+    )"
+  fi
+  export GPU_INVENTORY_JSON
   python3 - <<PY
 import json, os
+inventory = {}
+raw = os.environ.get("GPU_INVENTORY_JSON") or ""
+if raw.strip():
+    try:
+        inventory = json.loads(raw)
+    except json.JSONDecodeError:
+        inventory = {}
 print(json.dumps({
     "class": os.environ.get("GPU_SPACE_CLASS", ""),
     "recommended_deploy": os.environ.get("GPU_SPACE_DEPLOY", ""),
     "nested_docker": bool(int("${nested}")),
+    "tier_ok": bool(int("${GPU_TIER_OK}")),
     "shell_probe_rc": int("${GPU_PROBE_SHELL_RC:-127}"),
     "docker_probe_rc": int("${GPU_PROBE_DOCKER_RC:-127}"),
     "shell_alloc_ok": "ALLOC_OK" in """${GPU_PROBE_SHELL_OUT:-}""",
     "docker_alloc_ok": "ALLOC_OK" in """${GPU_PROBE_DOCKER_OUT:-}""",
+    "inventory": inventory,
 }, indent=2))
 PY
   exit "$exit_code"
@@ -99,6 +144,9 @@ else
   echo "  nvidia-smi        : not installed"
 fi
 echo
+echo "Capacity inventory (physical GPUs, accepted tiers only earn units)"
+print_gpu_inventory | sed 's/^/  /'
+echo
 echo "CUDA compute probes (NVML/nvidia-smi is NOT sufficient)"
 echo "  Shell namespace   : rc=${GPU_PROBE_SHELL_RC:-?} $(gpu_probe_has_alloc_ok "${GPU_PROBE_SHELL_OUT:-}" && echo ALLOC_OK || echo FAIL)"
 if [[ -n "${GPU_PROBE_SHELL_OUT:-}" ]]; then
@@ -111,7 +159,17 @@ fi
 echo
 echo "Classification      : ${GPU_SPACE_CLASS}"
 echo "Recommended deploy  : MINER_INFERENCE_DEPLOY=${GPU_SPACE_DEPLOY}"
+echo "Capacity tier gate  : $( [[ "${GPU_TIER_OK}" == "1" ]] && echo pass || echo FAIL )"
 echo
+
+if [[ "${GPU_TIER_CHECK_RC:-0}" -eq 2 ]]; then
+  echo "Verdict: REFUSED — GPU(s) present but none are on the subnet allowlist."
+  echo "  Miner install/start scripts will not run on this host."
+  echo "  python3 -m violet.miner.gpu_inventory --list-tiers"
+  echo "  Dev-only bypass: GPU_ALLOW_UNLISTED=1 (earns no Capacity)."
+  echo "============================================================"
+  exit 4
+fi
 
 case "$GPU_SPACE_CLASS" in
   bare_gpu_ok)

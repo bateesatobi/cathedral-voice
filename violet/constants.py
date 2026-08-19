@@ -8,6 +8,7 @@ module rather than being duplicated per-component.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Dict, List
 
@@ -42,22 +43,48 @@ class GpuTier:
     vram_gb: int
     multiplier: float
     status: str
-    #: Substrings matched (case-insensitively) against ``nvidia-smi`` output.
+    #: Tokens matched against ``nvidia-smi`` product names. Matching is
+    #: case-insensitive and uses alnum boundaries so ``a10`` does not match
+    #: ``A100``, ``l4`` does not match ``L40S``, and ``h200`` does not match
+    #: ``GH200``.
     match: tuple
 
     def matches(self, product_name: str) -> bool:
         name = (product_name or "").lower()
-        return any(token in name for token in self.match)
+        for token in self.match:
+            token = (token or "").lower().strip()
+            if not token:
+                continue
+            escaped = re.escape(token).replace(r"\ ", r"[\s\-]+")
+            if re.search(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", name):
+                return True
+        return False
 
 
-#: Only these GPUs are accepted. Order matters: the first match wins, so more
-#: specific entries (H100 NVL) must precede more general ones (H100).
+#: Only these GPUs are accepted. Order still prefers more specific SKUs
+#: (H100 NVL before H100, L40S before L40) when several tokens could apply.
 GPU_TIERS: List[GpuTier] = [
+    GpuTier("gb200", "GB200", 192, 5.0, "preferred", ("gb200",)),
+    GpuTier("b200", "B200", 192, 4.8, "preferred", ("b200",)),
+    GpuTier("gh200", "GH200 144 GB", 144, 3.8, "preferred", ("gh200",)),
+    GpuTier("gh200_96", "GH200 96 GB", 96, 2.9, "excellent", ()),
     GpuTier("h200", "H200", 141, 3.5, "preferred", ("h200",)),
     GpuTier("h100_nvl", "H100 NVL", 94, 2.7, "excellent", ("h100 nvl", "h100nvl")),
-    GpuTier("h100_80", "H100 80 GB", 80, 2.4, "excellent", ("h100",)),
-    GpuTier("a100_80", "A100 80 GB", 80, 1.6, "recommended", ("a100-sxm4-80", "a100 80", "a100-80")),
-    GpuTier("a100_40", "A100 40 GB", 40, 1.0, "minimum", ("a100",)),
+    GpuTier("h100_80", "H100 80 GB", 80, 2.4, "excellent", ("h100", "h800")),
+    GpuTier("a100_80", "A100 80 GB", 80, 1.6, "recommended", ("a100-sxm4-80", "a100 80", "a100-80", "a800 80", "a800-80")),
+    GpuTier("a100_40", "A100 40 GB", 40, 1.0, "minimum", ("a100", "a800")),
+    GpuTier("l40s", "L40S", 48, 0.90, "recommended", ("l40s", "l40 s")),
+    GpuTier("rtx_6000_ada", "RTX 6000 Ada", 48, 0.88, "recommended", ("rtx 6000 ada", "6000 ada")),
+    GpuTier("l40", "L40", 48, 0.80, "recommended", ("l40",)),
+    GpuTier("rtx_a6000", "RTX A6000", 48, 0.75, "recommended", ("rtx a6000", "a6000")),
+    GpuTier("a40", "A40", 48, 0.75, "recommended", ("a40",)),
+    GpuTier("rtx_5090", "RTX 5090", 32, 0.70, "accepted", ("rtx 5090", "5090")),
+    GpuTier("rtx_4090", "RTX 4090", 24, 0.50, "accepted", ("rtx 4090", "4090")),
+    GpuTier("a30", "A30", 24, 0.45, "accepted", ("a30",)),
+    GpuTier("l4", "L4", 24, 0.40, "accepted", ("l4",)),
+    GpuTier("a10", "A10", 24, 0.40, "accepted", ("a10g", "a10",)),
+    GpuTier("rtx_3090_ti", "RTX 3090 Ti", 24, 0.38, "accepted", ("rtx 3090 ti", "3090 ti")),
+    GpuTier("rtx_3090", "RTX 3090", 24, 0.35, "accepted", ("rtx 3090", "3090")),
 ]
 
 GPU_TIERS_BY_KEY: Dict[str, GpuTier] = {tier.key: tier for tier in GPU_TIERS}
@@ -74,14 +101,20 @@ MIN_SYSTEM_MEMORY_GB = 128
 def classify_gpu(product_name: str, vram_gb: float | None = None) -> GpuTier | None:
     """Return the accepted tier for a GPU product name, or ``None`` if rejected.
 
-    ``vram_gb`` disambiguates the A100 40/80 split, which cannot be resolved
-    from the product name alone on every driver version.
+    ``vram_gb`` disambiguates SKUs that share a product family (A100 40/80,
+    GH200 96/144) when the driver string is not specific enough.
     """
     for tier in GPU_TIERS:
         if not tier.matches(product_name):
             continue
-        if tier.key == "a100_40" and vram_gb and vram_gb >= 60:
-            return GPU_TIERS_BY_KEY["a100_80"]
+        name_l = (product_name or "").lower()
+        if tier.key == "a100_40":
+            if (vram_gb and vram_gb >= 60) or (
+                "80" in name_l and "40" not in name_l
+            ):
+                return GPU_TIERS_BY_KEY["a100_80"]
+        if tier.key == "gh200" and vram_gb and vram_gb < 120:
+            return GPU_TIERS_BY_KEY["gh200_96"]
         return tier
     return None
 

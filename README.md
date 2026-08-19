@@ -26,7 +26,7 @@ Miners (ASR/TTS) ──► cathedral-voice validator ──► Cathedral publish
 
 ## Miner quick start
 
-**Requirements:** NVIDIA GPU (A100 / H100 / H200 class), Ubuntu 22.04+, Docker, NVIDIA Container Toolkit, public TCP port for the sidecar, TAO for registration.
+**Requirements:** NVIDIA GPU (**RTX 3090** through **H200 / GH200 / B200 / GB200**), Ubuntu 22.04+, Docker, NVIDIA Container Toolkit, public TCP port for the sidecar, TAO for registration.
 
 > **Important:** Run on a **bare GPU VM or WSL2** where Docker is the host OS service. Nested GPU rental jobs often show `nvidia-smi` but block CUDA compute — see [GPU detection](#gpu-host-detection) below.
 

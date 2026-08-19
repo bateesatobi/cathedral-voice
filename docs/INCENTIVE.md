@@ -32,11 +32,25 @@ units = Σ (GPU tier multiplier)
 
 | GPU | Multiplier |
 |-----|------------|
-| A100 40 GB | 1.0 |
-| A100 80 GB | 1.6 |
-| H100 80 GB | 2.4 |
-| H100 NVL | 2.7 |
+| GB200 | 5.0 |
+| B200 | 4.8 |
+| GH200 144 GB | 3.8 |
 | H200 | 3.5 |
+| GH200 96 GB | 2.9 |
+| H100 NVL | 2.7 |
+| H100 / H800 80 GB | 2.4 |
+| A100 / A800 80 GB | 1.6 |
+| A100 / A800 40 GB | 1.0 |
+| L40S | 0.90 |
+| RTX 6000 Ada | 0.88 |
+| L40 | 0.80 |
+| A40 / RTX A6000 | 0.75 |
+| RTX 5090 | 0.70 |
+| RTX 4090 | 0.50 |
+| A30 | 0.45 |
+| L4 / A10 | 0.40 |
+| RTX 3090 Ti | 0.38 |
+| RTX 3090 | 0.35 |
 
 - More GPUs → more C (if accepted + healthy).
 - Offline half the week → ~half the credit.

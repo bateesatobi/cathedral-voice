@@ -63,6 +63,8 @@ if [[ "${STT_FORCE_CPU}" == "1" ]]; then
   want_stt=1
 else
   plan_gpu_devices "${GPU_PLAN_MODE:-both}"
+  log "GPU inventory for Capacity scoring:"
+  print_gpu_inventory | while IFS= read -r line; do log "  ${line}"; done
 fi
 
 run_cuda_gate() {

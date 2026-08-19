@@ -684,7 +684,8 @@ main() {
   if [[ "${STT_FORCE_CPU}" != "1" ]]; then
     install_nvidia_toolkit_if_needed "$SUDO"
     if command -v nvidia-smi &>/dev/null; then
-      log "GPUs: $(nvidia-smi --query-gpu=name --format=csv,noheader | paste -sd'; -')"
+      log "GPU inventory for Capacity scoring:"
+      print_gpu_inventory | while IFS= read -r line; do log "  ${line}"; done
     else
       warn "nvidia-smi not found — speaches needs an NVIDIA GPU + driver."
     fi

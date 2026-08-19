@@ -21,24 +21,53 @@ class TestGpuClassification:
         assert classify_gpu("NVIDIA H200").key == "h200"
         assert classify_gpu("NVIDIA H100 NVL").key == "h100_nvl"
         assert classify_gpu("NVIDIA H100 80GB HBM3").key == "h100_80"
+        assert classify_gpu("NVIDIA GB200").key == "gb200"
+        assert classify_gpu("NVIDIA B200").key == "b200"
+        assert classify_gpu("NVIDIA GH200", 144).key == "gh200"
+        assert classify_gpu("NVIDIA GH200", 96).key == "gh200_96"
+        assert classify_gpu("NVIDIA GeForce RTX 4090", 24).key == "rtx_4090"
+        assert classify_gpu("NVIDIA GeForce RTX 3090", 24).key == "rtx_3090"
+        assert classify_gpu("NVIDIA L40S", 48).key == "l40s"
+        assert classify_gpu("NVIDIA L4", 24).key == "l4"
+        assert classify_gpu("NVIDIA A10", 24).key == "a10"
+        assert classify_gpu("NVIDIA H800 80GB").key == "h100_80"
 
     def test_a100_split_resolved_by_vram(self):
         # The product name alone does not distinguish 40 GB from 80 GB on every
         # driver version.
         assert classify_gpu("NVIDIA A100-SXM4-40GB", 40).key == "a100_40"
         assert classify_gpu("NVIDIA A100", 80).key == "a100_80"
+        assert classify_gpu("NVIDIA A100-SXM4-80GB").key == "a100_80"
 
     def test_nvl_matched_before_plain_h100(self):
         # Order matters: "h100" substring-matches an NVL card too.
         assert classify_gpu("NVIDIA H100 NVL", 94).multiplier == 2.7
 
+    def test_short_tokens_do_not_steal_longer_skus(self):
+        assert classify_gpu("NVIDIA A100", 40).key == "a100_40"
+        assert classify_gpu("NVIDIA GH200", 141).key != "h200"
+        assert classify_gpu("NVIDIA GB200").key != "b200"
+        assert classify_gpu("NVIDIA L40", 48).key == "l40"
+        assert classify_gpu("NVIDIA L40S", 48).key != "l4"
+        assert classify_gpu("NVIDIA GeForce RTX 3090 Ti", 24).key == "rtx_3090_ti"
+
     def test_rejected_models(self):
-        assert classify_gpu("NVIDIA GeForce RTX 4090", 24) is None
-        assert classify_gpu("NVIDIA L40S", 48) is None
+        assert classify_gpu("NVIDIA GeForce RTX 3080", 10) is None
+        assert classify_gpu("NVIDIA T4", 16) is None
         assert classify_gpu("") is None
 
     def test_multipliers_increase_with_capability(self):
-        keys = ["a100_40", "a100_80", "h100_80", "h100_nvl", "h200"]
+        keys = [
+            "rtx_3090",
+            "a100_40",
+            "a100_80",
+            "h100_80",
+            "h100_nvl",
+            "h200",
+            "gh200",
+            "b200",
+            "gb200",
+        ]
         multipliers = [GPU_TIERS_BY_KEY[key].multiplier for key in keys]
         assert multipliers == sorted(multipliers)
 
@@ -57,18 +86,25 @@ class TestNvidiaSmiParsing:
 
     def test_reports_rejected_cards_rather_than_dropping_them(self):
         # The operator needs to know why a card earns nothing.
-        accepted, rejected = parse_nvidia_smi("0, NVIDIA GeForce RTX 4090, 24564, 512, 5\n")
+        accepted, rejected = parse_nvidia_smi("0, NVIDIA GeForce RTX 3080, 10240, 512, 5\n")
         assert not accepted
         assert len(rejected) == 1
-        assert "4090" in rejected[0]
+        assert "3080" in rejected[0]
 
     def test_mixed_host(self):
         output = (
             "0, NVIDIA H200, 143771, 0, 0\n"
-            "1, NVIDIA GeForce RTX 3090, 24576, 0, 0\n"
+            "1, NVIDIA GeForce RTX 3080, 10240, 0, 0\n"
         )
         accepted, rejected = parse_nvidia_smi(output)
         assert len(accepted) == 1 and len(rejected) == 1
+
+    def test_consumer_floor_is_accepted(self):
+        accepted, rejected = parse_nvidia_smi(
+            "0, NVIDIA GeForce RTX 3090, 24576, 0, 0\n"
+        )
+        assert not rejected
+        assert accepted[0].tier_key == "rtx_3090"
 
     def test_tolerates_garbage(self):
         accepted, _ = parse_nvidia_smi("not, valid\n\n[N/A]\n")
