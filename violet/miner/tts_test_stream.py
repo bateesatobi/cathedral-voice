@@ -3,7 +3,7 @@ Test TTS streaming — direct Spark/miner upstream or Phosai API (Violet router)
 
 Examples:
   # Phosai (Render + Violet router → GPU miner)
-  PHOSAI_API_URL=https://api.phosaico.com python tts_test_stream.py
+  PHOSAI_API_URL=https://phosai-backend-api-latest.onrender.com python tts_test_stream.py
 
   # Direct Spark / miner upstream
   TTS_URL=http://localhost:8002 TTS_MODE=direct python tts_test_stream.py
@@ -17,7 +17,7 @@ import wave
 import requests
 
 TTS_MIN_BYTES = int(os.environ.get("TTS_MIN_AUDIO_BYTES", "512"))
-PHOSAI_DEFAULT = "https://api.phosaico.com"
+PHOSAI_DEFAULT = "https://phosai-backend-api-latest.onrender.com"
 TTS_MODE = os.environ.get("TTS_MODE", "phosai").strip().lower()  # phosai | direct
 BASE_URL = (
     os.environ.get("TTS_URL")

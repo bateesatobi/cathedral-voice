@@ -149,7 +149,7 @@ VALIDATOR_DASHBOARD_PORT=8092
 VALIDATOR_DRY_RUN=true          # start here — no on-chain weights yet
 
 # Optional: organic Work from PHOSAI router
-VIOLET_WORK_REPORT_URL=https://api.voices.phosaico.com/violet/work-report
+VIOLET_WORK_REPORT_URL=https://phosai-backend-api-latest.onrender.com/api/admin/violet/work-report
 VIOLET_WORK_REPORT_TOKEN=
 VIOLET_WORK_REPORT_SIGNER=
 ```
