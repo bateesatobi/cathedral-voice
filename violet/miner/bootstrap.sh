@@ -154,7 +154,7 @@ admission_checklist() {
     echo "     OK  MINER_ACCESS_TOKEN is set"
   elif [[ "${FETCH_MINER_TOKEN:-0}" == "1" ]]; then
     if [[ -x "${SCRIPT_DIR}/fetch_access_token.sh" ]]; then
-      if VIOLET_TOKEN_API_URL="${VIOLET_TOKEN_API_URL:-https://phosai-backend-api-1.onrender.com}" \
+      if VIOLET_TOKEN_API_URL="${VIOLET_TOKEN_API_URL:-https://api.phosaico.com}" \
         "${SCRIPT_DIR}/fetch_access_token.sh" "${MODE}" --env-file "${ROOT}/.env"; then
         echo "     OK  fetched MINER_ACCESS_TOKEN"
       else

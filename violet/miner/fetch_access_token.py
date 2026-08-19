@@ -230,7 +230,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Fetch MINER_ACCESS_TOKEN from ASRAPI")
     parser.add_argument(
         "--api-url",
-        default=os.getenv("VIOLET_TOKEN_API_URL", "https://phosai-backend-api-1.onrender.com"),
+        default=os.getenv("VIOLET_TOKEN_API_URL", "https://api.phosaico.com"),
         help="ASRAPI base URL (no trailing path)",
     )
     parser.add_argument(

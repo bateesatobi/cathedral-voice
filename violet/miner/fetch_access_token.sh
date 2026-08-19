@@ -3,7 +3,7 @@
 #
 # Usage (from repo root):
 #   ./violet/miner/fetch_access_token.sh test --write-env
-#   VIOLET_TOKEN_API_URL=https://phosai-backend-api-1.onrender.com ./violet/miner/fetch_access_token.sh test --write-env
+#   VIOLET_TOKEN_API_URL=https://api.phosaico.com ./violet/miner/fetch_access_token.sh test --write-env
 #
 set -euo pipefail
 
